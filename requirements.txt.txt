@@ -1,5 +1,8 @@
 streamlit==1.32.0
 pandas
+requests
+openpyxlstreamlit==1.32.0
+pandas
 openpyxl
 selenium
 pdfplumber
