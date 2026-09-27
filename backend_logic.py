@@ -14,7 +14,7 @@ from typing import Optional
 TEMPLATE_FILE = "user_templates.json"
 
 DEFAULT_TEMPLATES = {
-    "wencai_conditions": [
+    "wencai_conditions": ["连续5年加权roe>25，连续5年净利润现金含量>80，连续5年毛利率>40，上市时间>3年，剔除北交所，非金融股",
         "连续3年ROE>15%，上市时间>5年，非ST，剔除金融业",
         "市盈率<20，市值>100亿，股息率>3%，现金流为正",
         "营业收入连续3年增长，净利润现金含量>80%"
