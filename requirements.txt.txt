@@ -10,7 +10,10 @@ requestsstreamlit
 pandas
 requests
 openpyxl
-python-docx
+python-docxstreamlit
+pandas
+requests
+openpyxl
 openai
 akshare
 duckduckgo-search
