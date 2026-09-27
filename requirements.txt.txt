@@ -6,7 +6,10 @@ pandas
 openpyxl
 selenium
 pdfplumber
+requestsstreamlit
+pandas
 requests
+openpyxl
 python-docx
 openai
 akshare
