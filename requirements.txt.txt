@@ -1,13 +1,13 @@
 streamlit==1.32.0
 pandas
-requests
-openpyxlstreamlit==1.32.0
 openpyxl
 selenium
 pdfplumber
-requestsstreamlit
-python-docxstreamlit
+requests
+python-docx
 openai
 akshare
 duckduckgo-search
 tavily-python
+streamlit
+pymupdf
