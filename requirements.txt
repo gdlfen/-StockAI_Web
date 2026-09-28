@@ -11,3 +11,7 @@ duckduckgo-search
 tavily-python
 streamlit
 pymupdf
+
+
+
+
