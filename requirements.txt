@@ -10,8 +10,3 @@ akshare
 duckduckgo-search
 tavily-python
 selenium
-chromium
-chromium-driver
-zlib1g-dev
-libjpeg-dev
-
