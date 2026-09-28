@@ -9,3 +9,4 @@ openai
 akshare
 duckduckgo-search
 tavily-python
+selenium
