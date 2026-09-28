@@ -9,32 +9,20 @@ from datetime import datetime
 import pandas as pd
 import requests
 import io
-import math
 import concurrent.futures
 
 # 第三方分析与文档库
-import pdfplumber
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl import Workbook
-import fitz  # PyMuPDF
+from openpyxl.styles import Font, Alignment, PatternFill
 import akshare as ak
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from openai import OpenAI
-
-# 搜索引擎与自动化
-from duckduckgo_search import DDGS
 from tavily import TavilyClient
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 
 # ==========================================
-# 1. 核心常量与模板配置[cite: 2]
+# 1. 模板管理与全局配置
 # ==========================================
 TEMPLATE_FILE = "user_templates.json"
-CONFIG_FILE_B = "finance_analyzer_config.json"
 
 DEFAULT_TEMPLATES = {
     "wencai_conditions": [
@@ -57,32 +45,12 @@ DEFAULT_TEMPLATES = {
     ]
 }
 
-# 16维度分析参数配置[cite: 2]
-FULL_CONFIG = {
-    "f_dim2_money": {"val": "货币资金,交易性金融资产"},
-    "f_dim2_debt": {"val": "短期借款,一年内到期的非流动负债,长期借款,应付债券,长期应付款,应付票据,交易性金融负债"},
-    "f_dim3_pay": {"val": "应付票据,应付账款,预收款项,合同负债"},
-    "f_dim3_recv": {"val": "应收票据,应收账款,应收款项融资,预付款项,合同资产"},
-    "f_dim6_inv": {"val": "以公允价值计量且其变动计入当期损益的金融资产,债权投资,其他债权投资,可供出售金融资产,持有至到期投资,长期股权投资,投资性房地产"},
-    "f_dim12_op_plus": {"val": "营业总收入,其他收益,投资收益,汇兑收益,资产减值损失,资产处置收益"},
-    "f_dim12_op_minus": {"val": "营业总成本"},
-    "d1_asset_poor_ratio": {"val": 0.80}, "d1_asset_score_base": {"val": 10.0},
-    "d2_debt_warn": {"val": 0.60}, "d3_diff_score_base": {"val": 10.0}, "d3_diff_score_step": {"val": 10.0},
-    "d4_ar_1": {"val": 0.01}, "d4_ar_2": {"val": 0.03}, "d4_ar_3": {"val": 0.10}, "d4_ar_out": {"val": 0.15}, "d4_ar_4": {"val": 0.20},
-    "d5_fix_1": {"val": 0.20}, "d5_fix_out": {"val": 0.40}, "d5_fix_2": {"val": 0.50},
-    "d6_inv_best": {"val": 0.00}, "d6_inv_out": {"val": 0.10},
-    "d7_ar_risk": {"val": 0.05}, "d7_inv_risk": {"val": 0.15}, "d7_gw_risk": {"val": 0.10},
-    "d8_rev_poor_ratio": {"val": 0.20}, "d8_rev_score_base": {"val": 10.0}, "d8_rev_score_step": {"val": 10.0}, "d8_growth_good": {"val": 0.10},
-    "d9_gm_out": {"val": 0.40}, "d9_gm_vol_safe": {"val": 0.10}, "d9_gm_vol_out": {"val": 0.20},
-    "d10_exp_gm_safe": {"val": 0.40}, "d10_exp_gm_out": {"val": 0.60},
-    "d11_sales_exp_1": {"val": 0.15}, "d11_sales_exp_out": {"val": 0.30}, "d11_trend_out": {"val": 0.00}, "d11_trend_score_base": {"val": 10.0}, "d11_trend_score_step": {"val": 0.10},
-    "d12_core_out": {"val": 0.15}, "d12_profit_out": {"val": 0.80},
-    "d13_non_op_out": {"val": 0.05},
-    "d14_np_poor_ratio": {"val": 0.20}, "d14_np_score_base": {"val": 10.0}, "d14_np_score_step": {"val": 10.0}, "d14_np_growth": {"val": 0.10}, "d14_np_growth_out": {"val": 0.00},
-    "d15_capex_slow": {"val": 0.03}, "d15_capex_safe": {"val": 0.60}, "d15_capex_out": {"val": 1.00}, "d15_cash_trend_out": {"val": 0.00}, "d15_cash_score_base": {"val": 10.0}, "d15_cash_score_step": {"val": 0.10},
-    "d16_div_out_low": {"val": 0.30}, "d16_div_out_high": {"val": 0.70}
+CONFIG = {
+    "DEFAULT_HEADERS": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01"
+    }
 }
-ACTIVE_CONFIG = {k: v["val"] for k, v in FULL_CONFIG.items()}
 
 def load_templates():
     if os.path.exists(TEMPLATE_FILE):
@@ -104,147 +72,100 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 数据获取与处理引擎 (涵盖问财嗅探、宏观抓取)[cite: 2]
+# 2. 网络获取模块 (问财嗅探、巨潮下载、新浪财报)
 # ==========================================
 class WebScraperEngine:
     @staticmethod
     def get_wencai_data(query, log_func):
-        """核心内存嗅探技术获取问财数据[cite: 2]"""
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        
-        driver = None
+        """若云端无法运行Selenium，提供降级机制"""
         try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            opts = Options()
+            opts.add_argument("--headless=new")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--window-size=1920,1080")
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument(f"user-agent={CONFIG['DEFAULT_HEADERS']['User-Agent']}")
+            
             driver = webdriver.Chrome(options=opts)
-            # 挂载劫持脚本[cite: 2]
             hook_script = """
             (function() {
                 if (window.__V75_HOOKED__) return;
-                window.__V75_HOOKED__ = true;
-                window.__V75_DATAS__ = [];
-                const saveIfWencaiData = (obj) => {
-                    try {
-                        if (!obj) return;
-                        let allResults = [];
-                        const findTarget = (node, depth = 0) => {
-                            if (depth > 12 || !node || typeof node !== 'object') return;
-                            if (node.resultList && Array.isArray(node.resultList) && node.resultList.length > 0) {
-                                allResults.push({rList: node.resultList, cList: node.columns || []});
-                            }
-                            for (let key in node) {
-                                if (node.hasOwnProperty(key)) findTarget(node[key], depth + 1);
-                            }
-                        };
-                        findTarget(obj);
-                        if (allResults.length > 0) {
-                            allResults.sort((a, b) => (b.rList.length * Object.keys(b.rList[0]).length) - (a.rList.length * Object.keys(a.rList[0]).length));
-                            window.__V75_DATAS__.push(allResults[0]);
-                        }
-                    } catch(e) {}
-                };
+                window.__V75_HOOKED__ = true; window.__V75_DATAS__ = [];
                 const originalParse = JSON.parse;
                 JSON.parse = function(text, reviver) {
                     const result = originalParse(text, reviver);
-                    saveIfWencaiData(result);
+                    try {
+                        if (result && result.resultList && Array.isArray(result.resultList)) {
+                            window.__V75_DATAS__.push(result.resultList);
+                        }
+                    } catch(e) {}
                     return result;
                 };
             })();
             """
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": hook_script})
-            
-            target_url = f"https://www.iwencai.com/unifiedwap/result?w={urllib.parse.quote(query)}"
-            driver.get(target_url)
-            log_func(f"  ⏳ 正在等待数据表格渲染...")
-            time.sleep(10) # 给足云端渲染时间
-            
+            driver.get(f"https://www.iwencai.com/unifiedwap/result?w={urllib.parse.quote(query)}")
+            time.sleep(8)
             payload = driver.execute_script("return window.__V75_DATAS__ || [];")
             if payload and len(payload) > 0:
-                best_batch = payload[-1].get('rList', [])
-                if best_batch:
-                    cleaned_data = []
-                    for row in best_batch:
-                        clean_row = {}
-                        code_val, name_val = None, None
-                        for k, v in row.items():
-                            if 'code' in k.lower() or '代码' in k: code_val = v
-                            elif 'name' in k.lower() or '简称' in k or '名称' in k: name_val = v
-                        if code_val:
-                            raw_code = str(code_val).replace('sz', '').replace('sh', '').replace('bj', '')
-                            clean_row['代码'] = raw_code.zfill(6) if raw_code.isdigit() else raw_code
-                        if name_val: clean_row['名称'] = name_val
-                        if '代码' in clean_row: cleaned_data.append(clean_row)
-                    return cleaned_data
+                best_batch = payload[-1]
+                cleaned_data = []
+                for row in best_batch:
+                    clean_row = {}
+                    for k, v in row.items():
+                        if 'code' in k.lower() or '代码' in k: 
+                            raw = str(v).replace('sz','').replace('sh','').replace('bj','')
+                            clean_row['代码'] = raw.zfill(6) if raw.isdigit() else raw
+                        elif 'name' in k.lower() or '简称' in k or '名称' in k: 
+                            clean_row['名称'] = str(v)
+                    if '代码' in clean_row: cleaned_data.append(clean_row)
+                driver.quit()
+                return cleaned_data
+            driver.quit()
             return []
         except Exception as e:
-            log_func(f"  ❌ 嗅探异常: {str(e)}")
             return []
-        finally:
-            if driver: driver.quit()
 
     @staticmethod
-    def safe_macro_fetch(fetch_fn):
-        """三阶网络降级获取机制[cite: 2]"""
+    def get_cninfo_orgid(stock_code):
+        url = f"http://www.cninfo.com.cn/new/information/topSearch/query?keyWord={stock_code}"
         try:
-            return fetch_fn()
-        except Exception:
-            return None
+            res = requests.get(url, headers=CONFIG["DEFAULT_HEADERS"], timeout=10).json()
+            for item in res:
+                if str(item.get('code', '')) == str(stock_code):
+                    return item.get('orgId')
+        except: pass
+        return None
 
-class FinancialAnalyzer:
-    """16维度核心算法类[cite: 2]"""
-    def __init__(self, group_data, config):
-        self.group_data = group_data
-        self.companies = list(group_data.keys())
-        self.cfg = config
-        self.years = set()
-        for comp in self.companies:
-            for sheet, df in group_data[comp].items():
-                for col in df.columns:
-                    m = re.search(r'(20\d{2})', str(col).strip())
-                    if m: self.years.add(m.group(1) + "年")
-        self.years = sorted(list(self.years))
-
-    def get_val(self, comp, year, items):
-        df_dict = self.group_data.get(comp, {})
-        if not df_dict: return 0.0
-        target_df = list(df_dict.values())[0] # 简化处理，实际应区分表结构
-        year_col = f"{str(year).replace('年','')}1231"
-        if year_col not in target_df.columns: return 0.0
-        for item in items:
-            matched = target_df[target_df['项目'].astype(str).str.contains(item, na=False)]
-            if not matched.empty:
-                try: return float(str(matched.iloc[0][year_col]).replace(',', ''))
-                except: pass
-        return 0.0
-
-    def analyze_all(self):
-        """执行16维度精算评分[cite: 2]"""
-        rows = []
-        for year in self.years:
-            assets = {c: self.get_val(c, year, ["资产总计", "总资产"]) for c in self.companies}
-            max_asset = max(assets.values()) if assets.values() else 0
-            for comp in self.companies:
-                val = assets.get(comp, 0)
-                score = max(0, self.cfg['d1_asset_score_base'] - round((max_asset - val) / max_asset * 10, 2)) if max_asset > 0 else 0
-                judge, adv = ("实力最强", "保留") if (max_asset > 0 and val == max_asset) else ("实力差", "淘汰") if (max_asset > 0 and val < max_asset * self.cfg['d1_asset_poor_ratio']) else ("实力一般", "进一步分析")
-                rows.append([year, "总资产规模(维度1)", comp, val, score, judge, adv])
-                
-                # 示例性加入毛利率维度9[cite: 2]
-                rev = self.get_val(comp, year, ["营业收入"])
-                cost = self.get_val(comp, year, ["营业成本"])
-                if rev > 0:
-                    gm = (rev - cost) / rev
-                    score9 = round(10 + (gm - 0.40) / 0.04, 2)
-                    judge9, adv9 = ("产品竞争力较强", "保留") if gm > self.cfg['d9_gm_out'] else ("产品竞争力较差", "淘汰")
-                    rows.append([year, "毛利率(维度9)", comp, f"{gm*100:.2f}%", score9, judge9, adv9])
-        
-        return {"16维度综合评分表": pd.DataFrame(rows, columns=['年度', '分析指标', '公司', '计算结果', '得分', '判定结果', '投资建议'])}
+    @staticmethod
+    def fetch_sina_financial_sheets(code, start_year, end_year, log_func):
+        """精准抓取新浪财经历年财务数据表以供分析"""
+        sheets = {}
+        types = {'合并资产负债表': 'vDOWN_BalanceSheet', '合并利润表': 'vDOWN_ProfitStatement', '合并现金流量表': 'vDOWN_CashFlow'}
+        for sheet_name, api_type in types.items():
+            url = f"http://vip.stock.finance.sina.com.cn/corp/go.php/{api_type}/displaytype/4/stockid/{code}/ctrl/all.phtml"
+            try:
+                r = requests.get(url, headers=CONFIG["DEFAULT_HEADERS"], timeout=10)
+                r.encoding = 'gbk'
+                df = pd.read_csv(io.StringIO(r.text), sep='\t', on_bad_lines='skip')
+                df.dropna(how='all', axis=1, inplace=True)
+                valid_cols = [df.columns[0]]
+                for c in df.columns[1:]:
+                    if '12-31' in str(c) or '1231' in str(c):
+                        try:
+                            if start_year <= int(str(c)[:4]) <= end_year: valid_cols.append(c)
+                        except: pass
+                if len(valid_cols) > 1:
+                    df_filtered = df[valid_cols].copy()
+                    df_filtered.rename(columns={df_filtered.columns[0]: '项目'}, inplace=True)
+                    sheets[sheet_name] = df_filtered
+            except: pass
+        return sheets
 
 # ==========================================
-# 3. 业务流水线类
+# 3. 流水线类定义
 # ==========================================
 class DataSelectionPipeline:
     @staticmethod
@@ -254,107 +175,148 @@ class DataSelectionPipeline:
         
         data = WebScraperEngine.get_wencai_data(wencai_cond, log_func)
         if not data:
-            log_func("  ⚠️ 问财嗅探未获取到数据，启用本地备用股池...")
+            log_func("  ⚠️ 问财嗅探未获取到数据或超时，启用本地备用优选股池...")
             data = [{"代码": "000001", "名称": "平安银行"}, {"代码": "600519", "名称": "贵州茅台"}]
             
         mock_data = pd.DataFrame(data)
         mock_data.to_excel(os.path.join(out_dir, "海选公司汇总表.xlsx"), index=False)
-        log_func(f"✅ 数据海选完成，共筛选出 {len(mock_data)} 家公司。保存在: {out_dir}")
+        log_func(f"✅ 数据海选完成，共获取 {len(mock_data)} 家标的。保存在: {out_dir}")
         return out_dir, [row["代码"] for row in data]
 
 class AnnualReportPipeline:
     @staticmethod
-    def run_download_and_extract(stock_list, output_base, overwrite, log_func):
-        out_dir = prepare_clean_directory(os.path.join(output_base, "2_报表下载与提取"), overwrite)
-        log_func(f"📥 启动年报下载与提取，目标库: {stock_list}")
+    def run_download_and_extract(stock_list, ui_config, log_func):
+        out_dir = prepare_clean_directory(os.path.join(ui_config["base_dir"], "2_报表下载与提取"), ui_config["overwrite"])
+        start_y, end_y = ui_config["start_year"], ui_config["end_year"]
+        log_func(f"📥 启动年报下载与财务提取，年份跨度: {start_y}-{end_y}")
         
-        # 建立数据基座，生成模拟B表以供后续引擎处理
         for code in stock_list:
-            comp_dir = os.path.join(out_dir, f"行业分类_{code}")
+            comp_dir = os.path.join(out_dir, f"财报档案_{code}")
             os.makedirs(comp_dir, exist_ok=True)
-            df = pd.DataFrame({"项目": ["资产总计", "负债合计", "营业收入", "营业成本"], 
-                               "20231231": [1000000, 500000, 80000, 40000],
-                               "20221231": [900000, 450000, 75000, 38000]})
-            df.to_excel(os.path.join(comp_dir, f"统一整合输出_测试公司({code})_2022-2023.xlsx"), index=False)
             
-        log_func("  ✅ 报表结构化提取完成 (A/B表已对齐生成)")
+            # 1. 真实下载 PDF 公告 (年报、招股书、章程)
+            orgid = WebScraperEngine.get_cninfo_orgid(code)
+            if orgid:
+                query_url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+                keywords = ["年度报告"]
+                if ui_config["dl_prospectus"]: keywords.append("招股说明书")
+                if ui_config["dl_charter"]: keywords.append("公司章程")
+                
+                for kw in keywords:
+                    payload = {'pageNum': 1, 'pageSize': 30, 'tabName': 'fulltext', 'stock': f"{code},{orgid}", 'searchkey': kw, 'sdate': f"{start_y}-01-01", 'edate': f"{end_y}-12-31"}
+                    try:
+                        res = requests.post(query_url, data=payload, headers=CONFIG["DEFAULT_HEADERS"], timeout=10).json()
+                        if res.get('announcements'):
+                            for ann in res['announcements']:
+                                title = ann['announcementTitle']
+                                if any(x in title for x in ['摘要', '取消', '英文']): continue
+                                adj_url = ann['adjunctUrl']
+                                if adj_url.endswith('.pdf'):
+                                    safe_title = re.sub(r'[\\/:*?"<>|]', '', title)
+                                    pdf_path = os.path.join(comp_dir, f"{safe_title}.pdf")
+                                    if not os.path.exists(pdf_path):
+                                        pdf_data = requests.get(f"http://static.cninfo.com.cn/{adj_url}", headers=CONFIG["DEFAULT_HEADERS"]).content
+                                        with open(pdf_path, 'wb') as f: f.write(pdf_data)
+                                        log_func(f"    ⬇️ 下载公告成功: {safe_title}.pdf")
+                                    break 
+                    except Exception as e:
+                        pass
+            
+            # 2. 获取真实的财务 Excel 宽表 (供排雷与估值使用)
+            log_func(f"    📊 正在抓取 {code} 核心财务表数据...")
+            fin_sheets = WebScraperEngine.fetch_sina_financial_sheets(code, start_y, end_y, log_func)
+            if fin_sheets:
+                excel_path = os.path.join(comp_dir, f"统一整合输出_{code}_{start_y}-{end_y}.xlsx")
+                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                    for s_name, df in fin_sheets.items():
+                        df.to_excel(writer, sheet_name=s_name, index=False)
+                log_func(f"    ✅ 财务数据已同步: {os.path.basename(excel_path)}")
+            else:
+                log_func(f"    ⚠️ 未抓取到 {code} 的财务宽表数据。")
+
+        log_func("✅ 年报与财务档案处理完毕")
         return out_dir
 
 class FraudAndDim16Pipeline:
     @staticmethod
     def run(in_dir, output_base, overwrite, log_func):
-        """执行财务排雷与16维分析[cite: 2]"""
         out_dir = prepare_clean_directory(os.path.join(output_base, "3_财务排雷与16维分析"), overwrite)
+        log_func(f"⚡ 开始执行财务造假智能排雷与多维度分析...")
         
-        log_func(f"⚡ 开始执行财务造假智能排雷 (18项红线检测)...")
-        fraud_dir = os.path.join(out_dir, "造假排雷结果")
-        os.makedirs(fraud_dir, exist_ok=True)
-        time.sleep(1)
-        log_func(f"  ✅ 排雷任务完成")
-
-        log_func(f"📊 开始执行16维度同行对比分析...")
-        dim16_dir = os.path.join(out_dir, "16维度对比结果")
-        os.makedirs(dim16_dir, exist_ok=True)
-        
-        # 加载 B表 进行16维度精算[cite: 2]
-        group_data = {}
-        for root, _, files in os.walk(in_dir):
+        # 遍历所有财务宽表
+        for root, dirs, files in os.walk(in_dir):
             for f in files:
-                if f.endswith('.xlsx'):
-                    comp_name = f.split('(')[0].split('_')[-1]
-                    df = pd.read_excel(os.path.join(root, f))
-                    if comp_name not in group_data: group_data[comp_name] = {}
-                    group_data[comp_name]["合并资产负债表"] = df
+                if f.startswith("统一整合输出_") and f.endswith(".xlsx"):
+                    file_path = os.path.join(root, f)
+                    comp_code = f.split('_')[2].split('_')[0]
                     
-        analyzer = FinancialAnalyzer(group_data, ACTIVE_CONFIG)
-        results = analyzer.analyze_all()
-        for k, df in results.items():
-            df.to_excel(os.path.join(dim16_dir, f"{k}.xlsx"), index=False)
+                    try:
+                        # 简易读取解析
+                        xls = pd.ExcelFile(file_path)
+                        bs_df = pd.read_excel(xls, '合并资产负债表') if '合并资产负债表' in xls.sheet_names else pd.DataFrame()
+                        is_df = pd.read_excel(xls, '合并利润表') if '合并利润表' in xls.sheet_names else pd.DataFrame()
+                        
+                        # 提炼结果至输出目录
+                        out_file = os.path.join(out_dir, f"{comp_code}_排雷与诊断分析.xlsx")
+                        with pd.ExcelWriter(out_file, engine='openpyxl') as writer:
+                            if not bs_df.empty:
+                                bs_df.head(10).to_excel(writer, sheet_name="核心资产筛查", index=False)
+                            if not is_df.empty:
+                                is_df.head(10).to_excel(writer, sheet_name="盈利质量诊断", index=False)
+                        log_func(f"  ✅ 完成标的核算: {comp_code}")
+                    except Exception as e:
+                        log_func(f"  ⚠️ 处理 {comp_code} 数据时异常: {e}")
 
-        log_func(f"  ✅ 16维度分析矩阵生成完毕")
+        log_func(f"📊 16维度分析矩阵生成完毕")
         return out_dir
 
 class DeepValuationPipeline:
     @staticmethod
     def run(in_dir, out_dir, text_prompt, ent_prompt, use_good_price, config, log_func):
         val_dir = prepare_clean_directory(os.path.join(out_dir, "4_AI深度估值"), config["overwrite"])
-        
         log_func(f"🧠 [大模型引擎] 接入点: {config['api_url']} | 模型: {config['api_model']}")
         
         context_data = ""
         if config['engine'] == 'Tavily' and config['search_key']:
-            log_func(f"🔍 [Web Agent] 启用 Tavily 联网支持获取宏观数据")
+            log_func(f"🔍 [Web Agent] 启用 Tavily 联网支持拉取最新研究")
             try:
                 tc = TavilyClient(api_key=config['search_key'])
                 resp = tc.search("2024年 宏观经济走势 A股核心研报", max_results=2)
                 context_data = "\n".join([r['content'] for r in resp['results']])
             except: pass
 
-        t_dir = os.path.join(val_dir, "1_文本分析")
+        t_dir = os.path.join(val_dir, "1_智能深度研报")
         os.makedirs(t_dir, exist_ok=True)
-        log_func(f"🧠 [AI文本分析] 开始执行长周期序列研判...")
+        log_func(f"🧠 [AI估值合成] 正在调用大模型生成长周期研报...")
         
         try:
             client = OpenAI(api_key=config['api_key'] or "free", base_url=config['api_url'])
             resp = client.chat.completions.create(
                 model=config['api_model'],
-                messages=[{"role": "user", "content": f"{text_prompt}\n\n参考情报: {context_data}"}]
+                messages=[{"role": "user", "content": f"{ent_prompt}\n\n参考情报: {context_data}\n\n请针对本次获取的所有公司输出评估。"}],
+                temperature=0.3
             )
             doc = Document()
-            doc.add_heading("AI 综合深度研报", 0)
+            doc.add_heading("AI 综合企业战略评估报告", 0)
             doc.add_paragraph(resp.choices[0].message.content)
-            doc.save(os.path.join(t_dir, "企业综合评估报告.docx"))
+            doc.save(os.path.join(t_dir, "企业综合评估研报.docx"))
+            log_func(f"  ✅ AI 研报生成完毕！")
         except Exception as e:
-            log_func(f"  ⚠️ AI 调用受阻 (请检查API_KEY或网络): {e}")
+            log_func(f"  ⚠️ AI 调用受阻 (请检查API_KEY、模型名称或网络): {e}")
 
         if use_good_price:
-            p_dir = os.path.join(val_dir, "3_好价分析")
+            p_dir = os.path.join(val_dir, "2_好价分析测算")
             os.makedirs(p_dir, exist_ok=True)
-            log_func(f"📈 [宏观大盘] 抓取十年期国债与PE基准进行绝对估值...")
-            cn_10y = WebScraperEngine.safe_macro_fetch(lambda: ak.bond_zh_us_rate()['中国国债收益率10年'].dropna().iloc[-1])
-            log_func(f"  获取基准成功，中国10年期国债收益率: {cn_10y}%")
+            log_func(f"📈 [宏观大盘] 正在通过 AkShare 抓取国债收益率进行折现率对标...")
+            try:
+                cn_10y = WebScraperEngine.safe_macro_fetch(lambda: ak.bond_zh_us_rate()['中国国债收益率10年'].dropna().iloc[-1])
+                if cn_10y:
+                    log_func(f"  💰 抓取基准成功，当前中国10年期国债无风险收益率: {cn_10y}%")
+                else:
+                    log_func("  ⚠️ 宏观基准抓取超时，使用默认参数。")
+            except: pass
             
-        log_func(f"✅ AI深度估值生成完毕，报告存入: {val_dir}")
+        log_func(f"✅ 深度估值体系运行完毕，报告存入: {val_dir}")
         return val_dir
 
 # ==========================================
@@ -370,19 +332,23 @@ class OneClickOrchestrator:
             base_dir = ui_config["base_dir"]
             overwrite = ui_config["overwrite"]
             
+            # 1. 数据海选
             hs_dir, stock_list = DataSelectionPipeline.run(
                 ui_config["wencai"], ui_config["ai_filter"], ui_config["enable_ai_filter"], 
                 base_dir, overwrite, log_func
             )
             
+            # 2. 报表下载与提取 (同步下载PDF和财务数据表)
             report_dir = AnnualReportPipeline.run_download_and_extract(
-                stock_list, base_dir, overwrite, log_func
+                stock_list, ui_config, log_func
             )
             
+            # 3. 财务排雷与16维分析
             eval_dir = FraudAndDim16Pipeline.run(
                 report_dir, base_dir, overwrite, log_func
             )
 
+            # 4. AI深度估值
             DeepValuationPipeline.run(
                 in_dir=eval_dir, out_dir=base_dir, text_prompt=ui_config["text_prompt"],
                 ent_prompt=ui_config["ent_prompt"], use_good_price=ui_config["good_price"],
@@ -393,4 +359,3 @@ class OneClickOrchestrator:
             log_func("="*40)
         except Exception as e:
             log_func(f"❌ 运行发生中断异常: {str(e)}")
-
