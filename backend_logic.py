@@ -7,43 +7,48 @@ import shutil
 import random
 from datetime import datetime
 import pandas as pd
+
+# ==========================================
+# 【终极网络防断联补丁】 (Monkey Patch)
+# 强制劫持 Python 底层的所有 requests 请求，包括 AkShare 内部发出的请求！
+# ==========================================
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
 
-# 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# 【核心修复】：强力清空代理环境变量，防止科学上网工具劫持流量导致断联
 os.environ["http_proxy"] = ""
 os.environ["https_proxy"] = ""
 os.environ["HTTP_PROXY"] = ""
 os.environ["HTTPS_PROXY"] = ""
-os.environ["all_proxy"] = ""
-os.environ["ALL_PROXY"] = ""
 
-def get_robust_session():
-    """创建一个带有自动重试机制与强伪装的 requests 会话，专治 Connection aborted"""
-    session = requests.Session()
+_original_session = requests.Session
+
+def get_global_robust_session():
+    """强制注入高强度伪装与防断联头"""
+    s = _original_session()
     retry = Retry(
         total=5, 
         read=5, 
         connect=5, 
-        backoff_factor=1, # 增加重试的退避时间
+        backoff_factor=1, 
         status_forcelist=[429, 500, 502, 503, 504]
     )
     adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    # 【核心修复】：高强度伪装请求头，防反爬拦截
-    session.headers.update({
+    s.mount('http://', adapter)
+    s.mount('https://', adapter)
+    s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Connection": "keep-alive"
+        # 【核心杀手锏】：强制关闭 Keep-Alive，防止服务端静默断开导致 RemoteDisconnected
+        "Connection": "close" 
     })
-    return session
+    return s
+
+# 替换 requests 库的默认会话机制，让 AkShare 强制使用我们的安全策略
+requests.Session = get_global_robust_session 
 
 # 第三方分析与文档库
 from openpyxl import Workbook
@@ -99,7 +104,8 @@ DEFAULT_TEMPLATES = {
 CONFIG = {
     "DEFAULT_HEADERS": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01"
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Connection": "close"
     }
 }
 
@@ -130,8 +136,7 @@ class AkShareRetryEngine:
     def execute(func_primary, func_fallback=None, log_func=None, task_name="", retries=3, delay=2):
         for i in range(retries):
             try:
-                # 【核心修复】：每次请求前加入 1.5~3.5 秒随机抖动，防止被东方财富/新浪防DDoS机制拉黑
-                time.sleep(random.uniform(1.5, 3.5))
+                time.sleep(random.uniform(1.0, 2.5)) # 随机抖动防DDoS机制拉黑
                 res = func_primary()
                 if isinstance(res, pd.DataFrame) and res.empty:
                     raise ValueError("主接口返回空数据")
@@ -143,9 +148,9 @@ class AkShareRetryEngine:
                 time.sleep(delay)
         
         if func_fallback:
-            if log_func: log_func(f"  🔄 [{task_name}] 正在切换至备用数据源...")
+            if log_func: log_func(f"  🔄 [{task_name}] 正在切换至原生底层备用数据源...")
             try:
-                time.sleep(random.uniform(2.0, 4.0))
+                time.sleep(random.uniform(1.5, 3.0))
                 res = func_fallback()
                 if not (isinstance(res, pd.DataFrame) and res.empty):
                     return res
@@ -162,35 +167,38 @@ class ApiDataEngine:
         delay = ui_config.get("ak_delay", 2)
         
         def _fetch_em(): return ak.stock_zh_a_spot_em()
-        def _fetch_sina(): 
-            df = ak.stock_zh_a_spot()
-            df.rename(columns={'symbol': '代码', 'name': '名称', 'mktcap': '总市值', 'pb': '市盈率-动态'}, inplace=True)
+        def _fetch_direct(): 
+            """原生直连东方财富核心API，绕开 AkShare 封装，绝对稳定"""
+            url = "http://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f20,f9"
+            res = requests.get(url, timeout=15).json()
+            df = pd.DataFrame(res['data']['diff'])
+            df.rename(columns={'f12': '代码', 'f14': '名称', 'f2': '最新价', 'f20': '总市值', 'f9': '市盈率-动态'}, inplace=True)
             return df
             
-        df = AkShareRetryEngine.execute(_fetch_em, _fetch_sina, log_func, "获取A股实时快照", retries, delay)
+        df = AkShareRetryEngine.execute(_fetch_em, _fetch_direct, log_func, "获取A股实时快照", retries, delay)
         
         if df.empty: return []
         
         try:
-            # 【核心修复】：在海选源头，彻底剔除北交所股票 (以8、9开头或包含bj)，防止后续抓取缺失数据而断联[cite: 1]
+            # 彻底剔除北交所股票 (以8、9开头或包含bj)
             df['代码'] = df['代码'].astype(str).str.lower()
             df = df[~df['代码'].str.match(r'^(8|9|bj)', na=False)]
 
             if "市盈率<" in query or "pe<" in query.lower():
                 val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
-                df = df[(df.get('市盈率-动态', 0) > 0) & (df.get('市盈率-动态', 0) < val)]
+                df = df[(pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') > 0) & 
+                        (pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') < val)]
             if "市值>" in query:
                 val = float(re.search(r'市值>(\d+)', query).group(1)) * 100000000
-                df = df[df.get('总市值', 0) > val]
+                df = df[pd.to_numeric(df.get('总市值', 0), errors='coerce') > val]
             if "非ST" in query:
-                df = df[~df['名称'].str.contains('ST')]
+                df = df[~df['名称'].str.contains('ST', na=False)]
             
             df = df.sort_values(by='总市值', ascending=False).head(10) if '总市值' in df.columns else df.head(10)
             
             cleaned_data = []
             for _, row in df.iterrows():
                 code_str = str(row['代码']).lower()
-                # 二次校验，坚决不要北交所
                 if code_str.startswith('8') or code_str.startswith('9') or 'bj' in code_str:
                     continue
                 cleaned_data.append({
@@ -219,7 +227,6 @@ class ApiDataEngine:
                 board_cons = AkShareRetryEngine.execute(_peers, None, log_func, f"获取 [{industry}] 行业成分股", retries, delay)
                 
                 if not board_cons.empty:
-                    # 过滤同行中的北交所
                     board_cons['代码'] = board_cons['代码'].astype(str).str.lower()
                     valid_peers = board_cons[~board_cons['代码'].str.match(r'^(8|9|bj)', na=False)]
                     peers = valid_peers[valid_peers['代码'] != stock_code].head(3)
@@ -254,7 +261,7 @@ class ApiDataEngine:
                     sheets[s_name] = df_filtered
         
         if not sheets:
-            log_func(f"  ⚠️ {code} 财报解析为空 (可能为银行/保险类特殊报表格式，已跳过阻断)。")
+            log_func(f"  ⚠️ {code} 财报解析为空 (可能为银行/保险类报表，格式特殊)。")
             
         return sheets
 
@@ -281,9 +288,8 @@ class ApiDataEngine:
     @staticmethod
     def get_cninfo_orgid(stock_code):
         url = "http://www.cninfo.com.cn/new/information/topSearch/query"
-        session = get_robust_session()
         try:
-            res = session.post(url, data={'keyWord': stock_code}, timeout=8).json()
+            res = requests.post(url, data={'keyWord': stock_code}, headers=CONFIG["DEFAULT_HEADERS"], timeout=10).json()
             for item in res:
                 if str(item.get('code', '')) == str(stock_code): return item.get('orgId')
         except: pass
@@ -333,8 +339,6 @@ class AnnualReportPipeline:
         start_y, end_y = ui_config["start_year"], ui_config["end_year"]
         log_func(f"📥 启动年报PDF下载与财务API全量提取，年份跨度: {start_y}-{end_y}")
 
-        session = get_robust_session()
-
         for item in stock_list_data:
             code = item["代码"]
             comp_name = item.get("名称", code)
@@ -352,8 +356,8 @@ class AnnualReportPipeline:
                 for kw in keywords:
                     payload = {'pageNum': 1, 'pageSize': 10, 'tabName': 'fulltext', 'stock': f"{code},{orgid}", 'searchkey': kw, 'sdate': f"{start_y}-01-01", 'edate': f"{end_y}-12-31", 'category': 'category_ndbg_szsh'}
                     try:
-                        time.sleep(random.uniform(1.5, 3.5)) # 增加PDF检索的延时防封
-                        res = session.post(query_url, data=payload, timeout=15).json()
+                        time.sleep(random.uniform(1.0, 2.0)) 
+                        res = requests.post(query_url, data=payload, headers=CONFIG["DEFAULT_HEADERS"], timeout=15).json()
                         if res and res.get('announcements'):
                             for ann in res['announcements']:
                                 title = ann['announcementTitle']
@@ -363,7 +367,7 @@ class AnnualReportPipeline:
                                     safe_title = re.sub(r'[\\/:*?"<>|]', '', title)
                                     pdf_path = os.path.join(comp_dir, f"{safe_title}.pdf")
                                     if not os.path.exists(pdf_path):
-                                        pdf_data = session.get(f"http://static.cninfo.com.cn/{adj_url}", timeout=25).content
+                                        pdf_data = requests.get(f"http://static.cninfo.com.cn/{adj_url}", headers=CONFIG["DEFAULT_HEADERS"], timeout=30).content
                                         with open(pdf_path, 'wb') as f: f.write(pdf_data)
                                         log_func(f"    ⬇️ 成功下载: {safe_title}.pdf")
                                     break 
@@ -375,7 +379,6 @@ class AnnualReportPipeline:
             
             excel_path = os.path.join(comp_dir, f"统一整合输出_{comp_name}_{code}_{start_y}-{end_y}.xlsx")
             with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                # 即使 fin_sheets 是空的，也要写入一张空表防止后续流程崩溃
                 if fin_sheets:
                     for s_name, df in fin_sheets.items():
                         df.to_excel(writer, sheet_name=s_name, index=False)
