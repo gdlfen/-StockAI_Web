@@ -29,12 +29,11 @@ st.set_page_config(page_title="纯API量化研报中枢", page_icon="📈", layo
 
 with st.sidebar:
     st.title("📚 帮助与指引")
-    with st.expander("📖 使用指引", expanded=False):
+    with st.expander("📖 系统重构说明", expanded=True):
         st.markdown("""
-        **系统重构说明**：
-        1. **底层引擎彻底革新**：全面放弃 Selenium 网页爬虫，替换为开源稳定合法的 `AkShare` 接口体系！
-        2. **硬核逻辑融合**：完美集成 18 项财务造假排雷预警、16维度基本面量化精算、AI年报穿透分析、以及基于中国10年国债基准的 DCF+格雷厄姆好价测算。
-        3. **极速运行**：彻底告别弹窗扫码与反爬拦截。
+        **1. 底层引擎彻底革新**：全面放弃 Selenium 网页爬虫，替换为开源稳定合法的 `AkShare` 接口体系！  
+        **2. 接口高可用机制**：内置三阶智能防断联与重连设计，完美解决 `Remote end closed connection` 异常。  
+        **3. 行业提取精准度升级**：修复平安银行变白酒 BUG，直接调取权威版块成分股。
         """)
 
 st.title("📈 价值投资智能分析系统 V6.0 (开源 API 纯享版)")
@@ -50,10 +49,14 @@ with tab1:
     st.header("⚙️ 引擎底座设置")
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("网络与检索层")
+        st.subheader("网络与 AkShare 引擎设置")
         engine = st.selectbox("搜寻网络环境", ["Bing", "DuckDuckGo", "360", "Tavily"], index=0)
         search_key = st.text_input("网络密钥 (仅Tavily等需要)", type="password")
         overwrite = st.toggle("系统自净模式 (每次运行前抹除旧档)", value=True)
+        
+        st.markdown("---")
+        ak_retries = st.number_input("AkShare 接口防断联最大重试次数", min_value=1, max_value=10, value=3)
+        ak_delay = st.number_input("接口重试等待延迟 (秒)", min_value=1, max_value=10, value=2)
 
     with col2:
         st.subheader("AI算力接入层")
@@ -135,6 +138,7 @@ if st.button("🚀 激活全链路 API 量化作业矩阵", type="primary", use_
     ui_config = {
         "base_dir": "./data_output",
         "engine": engine, "search_key": search_key, "overwrite": overwrite,
+        "ak_retries": ak_retries, "ak_delay": ak_delay,
         "api_url": api_url, "api_key": api_key, "api_model": api_model,
         "wencai": wencai_text, "enable_ai_filter": enable_ai_filter, "ai_filter": ai_filter_text,
         "start_year": start_year, "end_year": end_year, 
