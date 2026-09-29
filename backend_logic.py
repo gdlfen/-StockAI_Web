@@ -7,7 +7,6 @@ import shutil
 from datetime import datetime
 import pandas as pd
 import requests
-import concurrent.futures
 
 # 第三方分析与文档库
 from openpyxl import Workbook
@@ -86,16 +85,40 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 免费开源接口获取模块 (彻底替换 Selenium 爬虫)
+# 2. 高可用 AkShare 接口引擎
 # ==========================================
+class AkShareRetryEngine:
+    """封装带有防断联重试机制的API调度器"""
+    @staticmethod
+    def execute(func, log_func=None, task_name="", retries=3, delay=2):
+        for i in range(retries):
+            try:
+                res = func()
+                if isinstance(res, pd.DataFrame) and res.empty:
+                    raise ValueError("远端接口返回空数据")
+                return res
+            except Exception as e:
+                err_msg = str(e).split(':', 1)[0] if ':' in str(e) else str(e)
+                if log_func and i < retries - 1:
+                    log_func(f"  ⚠️ {task_name} 接口受阻 (尝试重连 {i+1}/{retries}). 原因: {err_msg}")
+                time.sleep(delay)
+        if log_func: log_func(f"  ❌ {task_name} 接口彻底失败。")
+        return pd.DataFrame()
+
 class ApiDataEngine:
     @staticmethod
-    def get_stock_screener_data(query, log_func):
-        """利用 AkShare 实时快照接口进行本地化 Pandas 选股"""
-        log_func("  👉 启动 AkShare 免费开源接口池进行数据海选 (完全脱离浏览器)...")
+    def get_stock_screener_data(query, ui_config, log_func):
+        log_func("  👉 启动 AkShare 引擎进行数据海选...")
+        retries = ui_config.get("ak_retries", 3)
+        delay = ui_config.get("ak_delay", 2)
+        
+        def _fetch(): return ak.stock_zh_a_spot_em()
+        df = AkShareRetryEngine.execute(_fetch, log_func, "获取A股实时快照", retries, delay)
+        
+        if df.empty: return []
+        
         try:
-            df = ak.stock_zh_a_spot_em()
-            # 简单策略解析引擎
+            # 策略解析
             if "市盈率<" in query or "pe<" in query.lower():
                 val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
                 df = df[(df['市盈率-动态'] > 0) & (df['市盈率-动态'] < val)]
@@ -105,75 +128,85 @@ class ApiDataEngine:
             if "非ST" in query:
                 df = df[~df['名称'].str.contains('ST')]
             
-            # 按市值降序取前10家避免API拥堵
             df = df.sort_values(by='总市值', ascending=False).head(10)
-            
-            cleaned_data = []
-            for _, row in df.iterrows():
-                code = str(row['代码']).zfill(6)
-                cleaned_data.append({"代码": code, "名称": str(row['名称']), "总市值": row['总市值'], "市盈率": row['市盈率-动态']})
-            
+            cleaned_data = [{"代码": str(row['代码']).zfill(6), "名称": str(row['名称']), "总市值": row['总市值'], "市盈率": row['市盈率-动态']} for _, row in df.iterrows()]
             return cleaned_data
         except Exception as e:
-            log_func(f"  ⚠️ AkShare 选股引擎异常: {e}")
+            log_func(f"  ⚠️ 选股策略解析异常: {e}")
             return []
 
     @staticmethod
-    def get_industry_competitors(stock_code):
-        """通过 AkShare 获取同行业前三名竞品"""
-        try:
-            stock_info = ak.stock_individual_info_em(symbol=stock_code)
-            industry = stock_info.loc[stock_info['item'] == '行业', 'value'].values[0]
-            board_cons = ak.stock_board_industry_cons_em(symbol=industry)
-            peers = board_cons[board_cons['代码'] != stock_code].head(3)
-            return peers[['代码', '名称']].to_dict('records'), industry
-        except Exception:
-            return [{"代码": "000858", "名称": "五粮液"}], "白酒"
+    def get_industry_competitors(stock_code, ui_config, log_func):
+        """精准提取同行，剔除硬编码兜底"""
+        retries = ui_config.get("ak_retries", 3)
+        delay = ui_config.get("ak_delay", 2)
+        
+        def _info(): return ak.stock_individual_info_em(symbol=stock_code)
+        stock_info = AkShareRetryEngine.execute(_info, log_func, f"获取 {stock_code} 个股信息", retries, delay)
+        
+        if not stock_info.empty:
+            try:
+                industry = stock_info.loc[stock_info['item'] == '行业', 'value'].values[0]
+                def _peers(): return ak.stock_board_industry_cons_em(symbol=industry)
+                board_cons = AkShareRetryEngine.execute(_peers, log_func, f"获取 {industry} 行业成分股", retries, delay)
+                
+                if not board_cons.empty:
+                    peers = board_cons[board_cons['代码'] != stock_code].head(3)
+                    return peers[['代码', '名称']].to_dict('records'), industry
+                return [], industry
+            except Exception: pass
+            
+        return [], "未知行业"
 
     @staticmethod
-    def fetch_financial_statements(code, start_year, end_year, log_func):
-        """利用 AkShare 接口抓取三大报表"""
+    def fetch_financial_statements(code, start_year, end_year, ui_config, log_func):
+        """增强版财报抓取，提高日期兼容性"""
+        retries = ui_config.get("ak_retries", 3)
+        delay = ui_config.get("ak_delay", 2)
         sheets = {}
         report_types = {'合并资产负债表': '资产负债表', '合并利润表': '利润表', '合并现金流量表': '现金流量表'}
         
         for s_name, api_type in report_types.items():
-            try:
-                time.sleep(1) # 限制频率
-                df = ak.stock_financial_report_sina(stock=code, symbol=api_type)
-                if not df.empty:
-                    valid_cols = [df.columns[0]]
-                    for c in df.columns[1:]:
-                        if '12-31' in str(c) or '1231' in str(c) or '报表日期' in str(c):
-                            try:
-                                yr = int(str(c)[:4])
-                                if start_year <= yr <= end_year: valid_cols.append(c)
-                            except: pass
-                    if len(valid_cols) > 1:
-                        df_filtered = df[valid_cols].copy()
-                        df_filtered.rename(columns={df_filtered.columns[0]: '项目'}, inplace=True)
-                        sheets[s_name] = df_filtered
-            except Exception as e:
-                pass
+            def _sheet(): return ak.stock_financial_report_sina(stock=code, symbol=api_type)
+            df = AkShareRetryEngine.execute(_sheet, log_func, f"抓取 {code} {s_name}", retries, delay)
+            
+            if not df.empty:
+                valid_cols = [df.columns[0]]
+                for c in df.columns[1:]:
+                    c_str = str(c).strip()
+                    # 容错匹配: '20231231', '2023-12-31', 甚至纯年份 '2023'
+                    if '12-31' in c_str or '1231' in c_str or re.match(r'^20\d{2}$', c_str):
+                        try:
+                            yr = int(c_str[:4])
+                            if start_year <= yr <= end_year: valid_cols.append(c)
+                        except: pass
+                if len(valid_cols) > 1:
+                    df_filtered = df[valid_cols].copy()
+                    df_filtered.rename(columns={df_filtered.columns[0]: '项目'}, inplace=True)
+                    sheets[s_name] = df_filtered
         return sheets
 
     @staticmethod
-    def get_dividend_and_employee(code):
-        """利用 AkShare 获取分红与员工数据"""
+    def get_dividend_and_employee(code, ui_config, log_func):
+        retries = ui_config.get("ak_retries", 3)
+        delay = ui_config.get("ak_delay", 2)
         data = {'项目': ['员工总数', '近三年平均分红率'], '最新数据': [0, "0%"]}
-        try:
-            div_df = ak.stock_history_dividend_detail(symbol=code)
-            if not div_df.empty: data['最新数据'][1] = "35.5%" # 简算模拟
-            
-            info_df = ak.stock_individual_info_em(symbol=code)
+        
+        def _div(): return ak.stock_history_dividend_detail(symbol=code)
+        div_df = AkShareRetryEngine.execute(_div, log_func, f"获取 {code} 分红明细", retries, delay)
+        if not div_df.empty: data['最新数据'][1] = "35.5%" # 简算模拟
+        
+        def _info(): return ak.stock_individual_info_em(symbol=code)
+        info_df = AkShareRetryEngine.execute(_info, log_func, f"获取 {code} 员工数", retries, delay)
+        if not info_df.empty:
             emp_row = info_df[info_df['item'].str.contains('员工')]
             if not emp_row.empty: data['最新数据'][0] = emp_row['value'].values[0]
             else: data['最新数据'][0] = 5000 
-        except: pass
+        
         return pd.DataFrame(data)
 
     @staticmethod
     def get_cninfo_orgid(stock_code):
-        """巨潮官方公开API (合规调用，非爬虫) 供PDF下载定位使用"""
         url = "http://www.cninfo.com.cn/new/information/topSearch/query"
         try:
             res = requests.post(url, data={'keyWord': stock_code}, headers=CONFIG["DEFAULT_HEADERS"], timeout=5).json()
@@ -187,16 +220,15 @@ class ApiDataEngine:
 # ==========================================
 class DataSelectionPipeline:
     @staticmethod
-    def run(wencai_cond, ai_filter, enable_ai_filter, output_base, overwrite, log_func):
-        out_dir = prepare_clean_directory(os.path.join(output_base, "1_数据海选"), overwrite)
+    def run(wencai_cond, ai_filter, enable_ai_filter, ui_config, log_func):
+        out_dir = prepare_clean_directory(os.path.join(ui_config["base_dir"], "1_数据海选"), ui_config["overwrite"])
         log_func(f"🔎 开始数据海选 (基于 API 策略)...\n  条件: {wencai_cond}")
 
-        data = ApiDataEngine.get_stock_screener_data(wencai_cond, log_func)
+        data = ApiDataEngine.get_stock_screener_data(wencai_cond, ui_config, log_func)
         if not data:
             log_func("  ⚠️ API 策略未命中数据，启用备用核心蓝筹股池...")
             data = [{"代码": "000001", "名称": "平安银行"}, {"代码": "600519", "名称": "贵州茅台"}]
         
-        # 自动扩展行业竞品
         extended_data = []
         seen = set()
         for item in data:
@@ -205,7 +237,7 @@ class DataSelectionPipeline:
                 extended_data.append(item)
                 seen.add(item['代码'])
                 
-                peers, ind = ApiDataEngine.get_industry_competitors(item['代码'])
+                peers, ind = ApiDataEngine.get_industry_competitors(item['代码'], ui_config, log_func)
                 item['所属行业'] = ind
                 for p in peers:
                     if p['代码'] not in seen:
@@ -233,7 +265,7 @@ class AnnualReportPipeline:
             comp_dir = os.path.join(out_dir, f"{ind}_{comp_name}_{code}")
             os.makedirs(comp_dir, exist_ok=True)
 
-            # 1. 调用公开 API 下载 PDF 原件
+            # 1. 下载 PDF 原件
             orgid = ApiDataEngine.get_cninfo_orgid(code)
             if orgid:
                 query_url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
@@ -262,8 +294,8 @@ class AnnualReportPipeline:
 
             # 2. 调用 API 获取财务数据宽表及补充信息
             log_func(f"    📊 正在通过接口获取 {comp_name} ({code}) 核心财务及员工分红数据...")
-            fin_sheets = ApiDataEngine.fetch_financial_statements(code, start_y, end_y, log_func)
-            emp_div_df = ApiDataEngine.get_dividend_and_employee(code)
+            fin_sheets = ApiDataEngine.fetch_financial_statements(code, start_y, end_y, ui_config, log_func)
+            emp_div_df = ApiDataEngine.get_dividend_and_employee(code, ui_config, log_func)
             
             excel_path = os.path.join(comp_dir, f"统一整合输出_{comp_name}_{code}_{start_y}-{end_y}.xlsx")
             with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
@@ -304,7 +336,6 @@ class FraudAndDim16Pipeline:
                         xls = pd.ExcelFile(file_path)
                         df_bs = pd.read_excel(xls, '合并资产负债表') if '合并资产负债表' in xls.sheet_names else pd.DataFrame()
                         df_is = pd.read_excel(xls, '合并利润表') if '合并利润表' in xls.sheet_names else pd.DataFrame()
-                        df_cf = pd.read_excel(xls, '合并现金流量表') if '合并现金流量表' in xls.sheet_names else pd.DataFrame()
 
                         year_cols = [c for c in df_bs.columns if re.match(r'^20\d{2}', str(c))]
                         year_cols.sort(reverse=True)
@@ -329,19 +360,14 @@ class FraudAndDim16Pipeline:
                         rev_inc = (rev_curr - rev_prev) / max(rev_prev, 1)
                         emp_drop = (emp_prev - emp_curr) / max(emp_prev, 1)
                         
-                        # 1. 员工减且营收大增
                         c1_status = "风险" if emp_drop > 0.1 and rev_inc > 0.1 else "正常"
                         fraud_results.append(["1. 员工人数减少但营收异常增加", c1_status])
-                        # 7. 货币资金比例
                         c7_status = "风险" if money/total_asset < 0.1 else "正常"
                         fraud_results.append(["7. (货币资金+交易性金融)/总资产 < 10%", c7_status])
-                        # 8. 应收账款比例
                         c8_status = "风险" if ar/total_asset > 0.15 else "正常"
                         fraud_results.append(["8. 应收账款/总资产 > 15%", c8_status])
-                        # 9. 固定资产比例
                         c9_status = "风险" if fa/total_asset > 0.40 else "正常"
                         fraud_results.append(["9. 固定资产/总资产 > 40%", c9_status])
-                        # 15. 存贷双高
                         c15_status = "风险" if (money/total_asset > 0.1) and (debt/total_asset > 0.1) else "正常"
                         fraud_results.append(["15. 高存高贷双雷(货币及借款占比皆高)", c15_status])
                         
@@ -351,24 +377,17 @@ class FraudAndDim16Pipeline:
                         # 核心逻辑 2: 16维度分析矩阵
                         # ===============================================
                         dim16_results = []
-                        # 维1: 总资产及成长性
                         dim16_results.append(["维度1: 总资产规模及成长性", "成长性好" if rev_inc > 0.1 else "成长性差", rev_curr])
-                        # 维2: 负债分析
                         debt_ratio = FraudAndDim16Pipeline.get_val(df_bs, ["负债合计", "总负债"], y_curr) / total_asset
                         dim16_results.append(["维度2: 资产负债率安全度", "安全" if debt_ratio < 0.6 else "淘汰", f"{debt_ratio*100:.1f}%"])
-                        # 维4: 应收及竞争力
                         ar_ratio = ar / total_asset
                         dim16_results.append(["维度4: 应收占资产比率(产品畅销度)", "畅销(保留)" if ar_ratio < 0.15 else "难销(淘汰)", f"{ar_ratio*100:.1f}%"])
-                        # 维6: 投产类专注度
                         dim16_results.append(["维度6: 投产类资产占比(主业专注度)", "专注主业" if gw/total_asset < 0.1 else "不专注", f"{gw/total_asset*100:.1f}%"])
-                        # 维9: 毛利率竞争力
                         cost = FraudAndDim16Pipeline.get_val(df_is, ["营业成本"], y_curr)
                         margin = (rev_curr - cost) / max(rev_curr, 1)
                         dim16_results.append(["维度9: 毛利率竞争力", "强(保留)" if margin > 0.4 else "较差(淘汰)", f"{margin*100:.1f}%"])
-                        # 维14: 净利润及持续性
                         np_val = FraudAndDim16Pipeline.get_val(df_is, ["净利润", "归属于母公司"], y_curr)
                         dim16_results.append(["维度14: 整体盈利能力(归母净利润)", "强" if np_val > 1e8 else "一般", np_val])
-                        # 维16: 分红率
                         dim16_results.append(["维度16: 现金分红股利支付率", "厚道且持续(保留)", "35%"])
 
                         dim16_df = pd.DataFrame(dim16_results, columns=["评估维度", "诊断评级", "核心指标值"])
@@ -393,7 +412,6 @@ class FraudAndDim16Pipeline:
 class DeepValuationPipeline:
     @staticmethod
     def extract_text_from_pdf(pdf_path):
-        """安全读取PDF原件前几页(通常含MD&A)供给大模型分析"""
         if PyPDF2 is None: return "【未安装PyPDF2，无法读取原件】"
         try:
             text = ""
@@ -471,7 +489,7 @@ class DeepValuationPipeline:
                 log_func(f"    📈 成功生成: {comp_name} 企业分析研报")
             except Exception: pass
 
-        # 3. 好价分析测算 (基于绝对估值模型)
+        # 3. 好价分析测算
         if use_good_price:
             p_dir = os.path.join(val_dir, "2_好价分析测算")
             os.makedirs(p_dir, exist_ok=True)
@@ -479,20 +497,30 @@ class DeepValuationPipeline:
             
             risk_free_rate = 2.5 
             sz_pe = 20.0
+            retries = config.get("ak_retries", 3)
+            delay = config.get("ak_delay", 2)
+            
             try:
-                cn_10y = ak.bond_zh_us_rate()['中国国债收益率10年'].dropna().iloc[-1]
-                risk_free_rate = float(cn_10y)
-                log_func(f"  💰 动态基准抓取成功: 中国10年国债收益率 {risk_free_rate}%")
+                def _bond(): return ak.bond_zh_us_rate()
+                bond_df = AkShareRetryEngine.execute(_bond, log_func, "获取中国10年期国债", retries, delay)
+                if not bond_df.empty:
+                    risk_free_rate = float(bond_df['中国国债收益率10年'].dropna().iloc[-1])
+                    log_func(f"  💰 动态基准抓取成功: 中国10年国债收益率 {risk_free_rate}%")
                 
                 # 获取A股实时动态PE中位数作为市场水位替代
-                spot_pe_df = ak.stock_zh_a_spot_em()
-                sz_pe = float(spot_pe_df['市盈率-动态'].median())
+                def _spot(): return ak.stock_zh_a_spot_em()
+                spot_pe_df = AkShareRetryEngine.execute(_spot, log_func, "获取A股大盘中位PE水位", retries, delay)
+                if not spot_pe_df.empty:
+                    sz_pe = float(spot_pe_df['市盈率-动态'].median())
             except: pass
 
             good_price_results = []
             
-            spot_df = ak.stock_zh_a_spot_em()
+            def _spot_full(): return ak.stock_zh_a_spot_em()
+            spot_df = AkShareRetryEngine.execute(_spot_full, log_func, "获取个股现价", retries, delay)
+            
             for comp_name in companies:
+                if spot_df.empty: continue
                 row = spot_df[spot_df['名称'].str.contains(comp_name, na=False)]
                 if row.empty: continue
                 current_price = float(row.iloc[0]['最新价'])
@@ -505,7 +533,7 @@ class DeepValuationPipeline:
                 elif sz_pe < 40 and comp_pe < 30 and div_yield > risk_free_rate * (2/3): judgment, color = "目前为偏买区", "yellow"
                 elif 40 < sz_pe < 60 and 30 < comp_pe < 50 and risk_free_rate*(1/3) < div_yield < risk_free_rate*(2/3): judgment, color = "目前为偏卖区", "blue"
                 
-                # 反推好价上限: Target Price = 15 * Price / PE
+                # 反推好价上限
                 target_price = (15 * current_price / comp_pe) if comp_pe > 0 else 0
 
                 good_price_results.append({
@@ -547,22 +575,21 @@ class OneClickOrchestrator:
             log_func(f"🚀 开始执行全开源API金融量化分析流水线")
             log_func(f"引擎: {ui_config['engine']} | 覆盖模式: {ui_config['overwrite']}")
             base_dir = ui_config["base_dir"]
-            overwrite = ui_config["overwrite"]
 
             # 1. 数据海选 (纯API版)
             hs_dir, stock_list_data = DataSelectionPipeline.run(
                 ui_config["wencai"], ui_config["ai_filter"], ui_config["enable_ai_filter"], 
-                base_dir, overwrite, log_func
+                ui_config, log_func
             )
 
-            # 2. 报表下载与提取 (纯API财报接口 + 原件下载)
+            # 2. 报表下载与提取
             report_dir = AnnualReportPipeline.run_download_and_extract(
                 stock_list_data, ui_config, log_func
             )
 
-            # 3. 财务排雷与16维分析 (全面植入硬核公式)
+            # 3. 财务排雷与16维分析
             eval_dir = FraudAndDim16Pipeline.run(
-                report_dir, base_dir, overwrite, log_func
+                report_dir, base_dir, ui_config["overwrite"], log_func
             )
 
             # 4. AI深度估值与好价测算
