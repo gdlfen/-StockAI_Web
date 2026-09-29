@@ -25,27 +25,20 @@ def save_new_template(category, new_text):
 # ==========================================
 # 1. 页面配置与侧边栏
 # ==========================================
-st.set_page_config(page_title="量化研报中枢", page_icon="📈", layout="wide")
+st.set_page_config(page_title="纯API量化研报中枢", page_icon="📈", layout="wide")
 
 with st.sidebar:
     st.title("📚 帮助与指引")
     with st.expander("📖 使用指引", expanded=False):
         st.markdown("""
-        **系统流转机制**：
-        1. **全局配置**：设定网络节点与底层 LLM 模型参数。
-        2. **数据海选**：首日运行若触发问财抓取，请查看后台终端是否弹出微信扫码，扫码一次后本地记忆。
-        3. **同业关联**：系统在获取基础池后将自发关联同业前三标的。
-        4. **一键启动**：完整贯穿年报下载、16维度评级、文字报告撰写及DCF好价估算。
+        **系统重构说明**：
+        1. **底层引擎彻底革新**：全面放弃 Selenium 网页爬虫，替换为开源稳定合法的 `AkShare` 接口体系！
+        2. **硬核逻辑融合**：完美集成 18 项财务造假排雷预警、16维度基本面量化精算、AI年报穿透分析、以及基于中国10年国债基准的 DCF+格雷厄姆好价测算。
+        3. **极速运行**：彻底告别弹窗扫码与反爬拦截。
         """)
 
-    with st.expander("❓ 疑难解答", expanded=False):
-        st.markdown("""
-        - **什么是Tavily？** 专为 AI 赋予实时检索能力的搜索引擎。
-        - **问财扫描中断？** 请留意控制台。系统已集成 user-data-dir，扫描一次永久生效。
-        """)
-
-st.title("📈 量化投研管理系统 v5.0")
-st.caption("全维度扩展 | PDF穿透提取 | 同业智能分析 | 好价贴现估值")
+st.title("📈 价值投资智能分析系统 V6.0 (开源 API 纯享版)")
+st.caption("全维度扩展 | API直连穿透提取 | 同业智能分析 | 好价贴现估值")
 
 # 顶部核心业务流 Tabs
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["⚙️全局配置", "🔍数据海选", "📥年报处理", "📊排雷与16维", "🧠AI深度估值"])
@@ -76,10 +69,10 @@ with tab1:
         api_model = st.selectbox("核心调用模型", ["deepseek-chat", "gpt-4o", "gpt-4-turbo", "claude-3-5-sonnet"], index=0)
 
 with tab2:
-    st.header("🔍 数据海选策源地")
+    st.header("🔍 数据海选策源地 (基于 API 计算池)")
 
     st.subheader("1. 基础硬指标初筛")
-    wencai_sel = st.selectbox("调用预设策略（问财指标）", st.session_state.templates["wencai_conditions"])
+    wencai_sel = st.selectbox("调用预设策略（输入数值如: 市盈率<20，市值>100亿）", st.session_state.templates["wencai_conditions"])
     wencai_text = st.text_area("策略修改区", value=wencai_sel, height=80)
     if st.button("💾 将上方指标存入策略库"):
         save_new_template("wencai_conditions", wencai_text)
@@ -98,47 +91,47 @@ with tab2:
 
 with tab3:
     st.header("📥 A/B 表融合作业层")
-    st.info("系统将前往巨潮抓取真实PDF，赴新浪拉取历年数据表，并通过 AkShare 动态补全新晋分红与员工统计资料。")
+    st.info("系统将直接通过 AkShare 金融接口安全抓取新浪/东财底层原表（资产负债、利润、现金流、员工分红），并调用巨潮合规 API 提取原件 PDF 供 AI 阅读。")
 
     st.subheader("时间跨度与公告选择")
     current_year = datetime.now().year
     col_y1, col_y2 = st.columns(2)
     with col_y1:
-        start_year = st.number_input("年报下载起点 (年份)", min_value=2000, max_value=current_year, value=current_year-3)
+        start_year = st.number_input("财报提取起点 (年份)", min_value=2000, max_value=current_year, value=current_year-3)
     with col_y2:
-        end_year = st.number_input("年报下载终点 (年份)", min_value=2000, max_value=current_year, value=current_year)
+        end_year = st.number_input("财报提取终点 (年份)", min_value=2000, max_value=current_year, value=current_year)
 
-    dl_prospectus = st.checkbox("同时下载该公司的【招股说明书】(PDF)", value=True)
-    dl_charter = st.checkbox("同时下载该公司的【公司章程】(PDF)", value=True)
+    dl_prospectus = st.checkbox("同源下载该公司的【招股说明书】(PDF)", value=True)
+    dl_charter = st.checkbox("同源下载该公司的【公司章程】(PDF)", value=True)
 
 with tab4:
     st.header("📊 量化评级与排雷中枢")
-    st.info("内置 16 维财报雷达诊断及专项存贷双高、频繁更换会所等核心造假识别风控。生成结果带有指标核算与风险定级。")
+    st.info("已内嵌【18大类财务造假识别模型】(存贷双高/营收背离等) 及 【16维度基本面量化精算】体系。")
 
 with tab5:
     st.header("🧠 AI 战略级研报合成")
 
     st.subheader("1. 长期财报穿透分析指令 (AI文本分析)")
     txt_sel = st.selectbox("载入预设提词", st.session_state.templates["ai_text_prompts"])
-    txt_prompt = st.text_area("提词器编辑区 (MD&A剖析)", value=txt_sel, height=120)
+    txt_prompt = st.text_area("提词器编辑区 (MD&A精析)", value=txt_sel, height=120)
     if st.button("💾 收录为新文本分析模板"): save_new_template("ai_text_prompts", txt_prompt)
 
     st.divider()
 
     st.subheader("2. 企业护城河与竞争格局研判指令 (AI企业分析)")
     ent_sel = st.selectbox("载入预设提词", st.session_state.templates["ai_enterprise_prompts"])
-    ent_prompt = st.text_area("企业提词器编辑区 (行业定位)", value=ent_sel, height=120)
+    ent_prompt = st.text_area("企业提词器编辑区 (护城河穿透)", value=ent_sel, height=120)
     if st.button("💾 收录为新企业估值模板"): save_new_template("ai_enterprise_prompts", ent_prompt)
 
     st.divider()
-    good_price = st.checkbox("融合宏观基准：利用绝对估值模型及DCF贴现推演个股『好价』", value=True)
+    good_price = st.checkbox("开启自动【好价分析】(实时对标国债与市盈率计算目标建仓价)", value=True)
 
 st.divider()
 
 # ==========================================
 # 3. 总控台启动器
 # ==========================================
-if st.button("🚀 激活全链路量化作业矩阵", type="primary", use_container_width=True):
+if st.button("🚀 激活全链路 API 量化作业矩阵", type="primary", use_container_width=True):
     ui_config = {
         "base_dir": "./data_output",
         "engine": engine, "search_key": search_key, "overwrite": overwrite,
@@ -149,25 +142,24 @@ if st.button("🚀 激活全链路量化作业矩阵", type="primary", use_conta
         "text_prompt": txt_prompt, "ent_prompt": ent_prompt, "good_price": good_price
     }
 
-    with st.spinner('集群运算中，请保持网络环境稳定，切勿刷新...'):
+    with st.spinner('接口并行调度中，速度极快，切勿刷新...'):
         log_box = st.empty()
         logs = []
 
         def web_log(msg):
             logs.append(msg)
-            # 保留最近的30条记录，便于完整查看运行状态
             log_box.text_area("节点实时作业监控 (近30条记录)", "\n".join(logs[-30:]), height=350)
 
         try:
             OneClickOrchestrator.run_all(ui_config, log_func=web_log)
-            st.success("🎉 数据闭环打通，16维脱水报表与独立公司研报已成功落盘！")
+            st.success("🎉 数据闭环彻底打通！全部独立研报与安全边际精算表均已生成！")
 
             output_dir = ui_config["base_dir"]
             if os.path.exists(output_dir):
                 zip_path = shutil.make_archive(base_name="量化研报结果汇总", format="zip", root_dir=output_dir)
                 with open(zip_path, "rb") as f:
                     st.download_button(
-                        label="📦 [获取成果] 下载全部脱水数据与研报库 (ZIP)",
+                        label="📦 [获取成果] 下载全部核心脱水数据与研报库 (ZIP)",
                         data=f, file_name=f"量化研报汇总_{int(time.time())}.zip",
                         mime="application/zip", use_container_width=True
                     )
