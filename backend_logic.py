@@ -80,7 +80,7 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 网络获取模块 (Pywencai + AkShare 灾备)
+# 2. 免费开源接口获取模块 (纯 API 架构 - 彻底绕开问财)
 # ==========================================
 class AkShareRetryEngine:
     @staticmethod
@@ -92,53 +92,76 @@ class AkShareRetryEngine:
                     res = func()
                     if isinstance(res, pd.DataFrame) and res.empty:
                         raise ValueError("接口返回空数据")
+                    if log_func and i > 0: log_func(f"  ✅ [{task_name}] 节点重试成功。")
                     return res
                 except Exception as e:
+                    err_msg = str(e).split(':', 1)[0] if ':' in str(e) else str(e)
+                    if log_func:
+                        log_func(f"  ⚠️ [{task_name}] 节点{func_idx+1}受阻 (重试 {i+1}/{retries}). 原因: {err_msg}")
                     time.sleep(delay)
+            if log_func and func_idx < len(funcs) - 1:
+                log_func(f"  🔄 正在切换至备用数据源 {func_idx+2}...")
+                
         if log_func: log_func(f"  ❌ [{task_name}] 所有接口彻底失败，返回安全空值。")
         return pd.DataFrame()
 
+
 class ApiDataEngine:
     @staticmethod
-    def get_wencai_data_cloud(query, log_func):
-        """【核心修复】：专为云平台打造的 pywencai 问财接口，彻底弃用 Selenium"""
-        log_func(f"  👉 启动 pywencai 云端引擎执行指令: {query}")
+    def get_stock_screener_data(query, log_func):
+        """采用底层 urllib 绕过云端代理劫持，直接请求东财接口，彻底免疫问财拦截"""
+        log_func("  👉 启动底层 API 引擎进行数据海选 (完全脱离问财)...")
         try:
-            import pywencai
-            # 直接调用问财底层 API 接口，返回 Pandas DataFrame
-            df = pywencai.get(query=query)
+            import urllib.request
+            # 直接调用东财行情底层高速接口
+            url = "http://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f20,f9"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             
-            if df is None or df.empty:
-                log_func("  ⚠️ 问财接口未返回数据，可能是条件过严或命中了高频限制。")
-                return []
+            # 强制建立无代理通道，防止云平台网络规则干扰
+            proxy_handler = urllib.request.ProxyHandler({})
+            opener = urllib.request.build_opener(proxy_handler)
+            
+            with opener.open(req, timeout=15) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                df = pd.DataFrame(data['data']['diff'])
+                df.rename(columns={'f12': '代码', 'f14': '名称', 'f2': '最新价', 'f20': '总市值', 'f9': '市盈率-动态'}, inplace=True)
+            
+            # 【核心规则】：精准剔除北交所 (8、9开头)
+            df['代码'] = df['代码'].astype(str).str.lower()
+            df = df[~df['代码'].str.match(r'^(8|9|bj)', na=False)]
+
+            # 本地解析你的查询条件
+            if "市盈率<" in query or "pe<" in query.lower():
+                val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
+                df = df[(pd.to_numeric(df['市盈率-动态'], errors='coerce') > 0) & 
+                        (pd.to_numeric(df['市盈率-动态'], errors='coerce') < val)]
+            if "市值>" in query:
+                val = float(re.search(r'市值>(\d+)', query).group(1)) * 100000000
+                df = df[pd.to_numeric(df['总市值'], errors='coerce') > val]
+            if "非ST" in query:
+                df = df[~df['名称'].str.contains('ST', na=False)]
+            if "非金融股" in query:
+                df = df[~df['名称'].str.contains('银行|证券|保险|信托', na=False)]
+            
+            # 按照市值从大到小排序，选取头部标的
+            df = df.sort_values(by='总市值', ascending=False).head(10)
             
             cleaned_data = []
             for _, row in df.iterrows():
-                clean_row = {}
-                for k, v in row.items():
-                    # 灵活适配问财返回的动态列名
-                    if '代码' in k or 'code' in k.lower():
-                        raw = str(v).replace('sz', '').replace('sh', '').replace('bj', '').split('.')[0]
-                        clean_row['代码'] = raw.zfill(6) if raw.isdigit() else raw
-                    elif '简称' in k or '名称' in k or 'name' in k.lower():
-                        clean_row['名称'] = str(v)
-                
-                # 严格执行北交所剔除逻辑
-                if '代码' in clean_row:
-                    code_str = clean_row['代码'].lower()
-                    if not (code_str.startswith('8') or code_str.startswith('9') or 'bj' in code_str):
-                        cleaned_data.append(clean_row)
-            
+                cleaned_data.append({
+                    "代码": str(row['代码']).zfill(6), 
+                    "名称": str(row['名称']), 
+                    "总市值": row.get('总市值', 0), 
+                    "市盈率": row.get('市盈率-动态', 0)
+                })
             return cleaned_data
-        except ImportError:
-            log_func("  ❌ 致命错误：环境中未安装 pywencai 库，请检查 requirements.txt")
-            return []
         except Exception as e:
-            log_func(f"  ⚠️ pywencai 引擎抓取异常: {e}")
-            return []
+            log_func(f"  ⚠️ 海选策略解析异常，启用备用池: {e}")
+            return [{"代码": "000858", "名称": "五粮液"}, {"代码": "600519", "名称": "贵州茅台"}]
 
     @staticmethod
     def fetch_financial_statements(code, start_year, end_year, log_func):
+        """利用 AkShare 抓取三大报表"""
         sheets = {}
         report_types = {'合并资产负债表': '资产负债表', '合并利润表': '利润表', '合并现金流量表': '现金流量表'}
         for s_name, api_type in report_types.items():
@@ -176,15 +199,12 @@ class ApiDataEngine:
 # ==========================================
 class DataSelectionPipeline:
     @staticmethod
-    def run(wencai_cond, ai_filter, enable_ai_filter, output_base, overwrite, log_func):
-        out_dir = prepare_clean_directory(os.path.join(output_base, "1_数据海选"), overwrite)
-        log_func(f"🔎 开始数据海选...\n  问财条件: {wencai_cond}")
+    def run(wencai_cond, ai_filter, enable_ai_filter, ui_config, log_func):
+        out_dir = prepare_clean_directory(os.path.join(ui_config["base_dir"], "1_数据海选"), ui_config["overwrite"])
+        log_func(f"🔎 开始数据海选...\n  筛选条件: {wencai_cond}")
 
-        # 【核心修改】：调用全新的 pywencai 引擎
-        data = ApiDataEngine.get_wencai_data_cloud(wencai_cond, log_func)
-        if not data:
-            log_func("  ⚠️ 问财获取数据失败，启用本地备用优选股池...")
-            data = [{"代码": "000001", "名称": "平安银行"}, {"代码": "600519", "名称": "贵州茅台"}]
+        # 直接调用重写后的东财 API 引擎，彻底绕开问财
+        data = ApiDataEngine.get_stock_screener_data(wencai_cond, log_func)
         
         # 自动抓取同业前三标的
         log_func("  🔄 正在通过 AkShare 识别行业属性并获取同业前三标的...")
