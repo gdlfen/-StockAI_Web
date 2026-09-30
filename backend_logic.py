@@ -200,11 +200,12 @@ class ApiDataEngine:
 class DataSelectionPipeline:
     @staticmethod
     def run(wencai_cond, ai_filter, enable_ai_filter, ui_config, log_func):
+        # 修正：直接从 ui_config 字典中提取 base_dir 和 overwrite
         out_dir = prepare_clean_directory(os.path.join(ui_config["base_dir"], "1_数据海选"), ui_config["overwrite"])
         log_func(f"🔎 开始数据海选...\n  筛选条件: {wencai_cond}")
 
         # 直接调用重写后的东财 API 引擎，彻底绕开问财
-        data = ApiDataEngine.get_stock_screener_data(wencai_cond, log_func)
+        data = ApiDataEngine.get_stock_screener_data(wencai_cond, ui_config, log_func)
         
         # 自动抓取同业前三标的
         log_func("  🔄 正在通过 AkShare 识别行业属性并获取同业前三标的...")
@@ -547,23 +548,38 @@ class DeepValuationPipeline:
         log_func(f"✅ 深度估值体系运行完毕，报告存入: {val_dir}")
         return val_dir
 
+# ==========================================
+# 4. 全局一键启动流水线调度器
+# ==========================================
 class OneClickOrchestrator:
     @staticmethod
     def run_all(ui_config, log_func):
         try:
             log_func("="*40)
-            log_func(f"🚀 开始执行金融智能量化分析流水线")
+            log_func(f"🚀 开始执行全开源API金融量化分析流水线")
+            log_func(f"引擎: {ui_config['engine']} | 覆盖模式: {ui_config['overwrite']}")
             base_dir = ui_config["base_dir"]
 
-            # 1. 数据海选
+            # 1. 数据海选 (纯API版)
+            # 【核心修复】：参数数量严格对齐 5 个
             hs_dir, stock_list_data = DataSelectionPipeline.run(
-                ui_config["wencai"], ui_config["ai_filter"], ui_config["enable_ai_filter"], 
-                base_dir, ui_config["overwrite"], log_func
+                ui_config["wencai"], 
+                ui_config["ai_filter"], 
+                ui_config["enable_ai_filter"], 
+                ui_config,  # 传入字典本身，替代原本拆开的 base_dir, overwrite
+                log_func
             )
+
             # 2. 报表下载与提取
-            report_dir = AnnualReportPipeline.run_download_and_extract(stock_list_data, ui_config, log_func)
+            report_dir = AnnualReportPipeline.run_download_and_extract(
+                stock_list_data, ui_config, log_func
+            )
+
             # 3. 财务排雷与16维分析
-            eval_dir = FraudAndDim16Pipeline.run(report_dir, base_dir, ui_config["overwrite"], log_func)
+            eval_dir = FraudAndDim16Pipeline.run(
+                report_dir, base_dir, ui_config["overwrite"], log_func
+            )
+
             # 4. AI深度估值与好价测算
             DeepValuationPipeline.run(
                 in_dir=eval_dir, out_dir=base_dir, text_prompt=ui_config["text_prompt"],
@@ -574,4 +590,6 @@ class OneClickOrchestrator:
             log_func("🎉 全链路任务完美收官！所有数据核算与报告生成完毕。")
             log_func("="*40)
         except Exception as e:
+            import traceback
             log_func(f"❌ 运行发生中断异常: {str(e)}")
+            traceback.print_exc() # 在后台打印详细堆栈以防万一
