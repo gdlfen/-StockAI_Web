@@ -26,20 +26,17 @@ _original_session = requests.Session
 def get_global_robust_session():
     """强制注入高强度伪装与防代理劫持机制"""
     s = _original_session()
-    s.trust_env = False  # 终极杀手锏：无视系统及注册表代理，彻底防止劫持断联
+    s.trust_env = False  
     s.proxies = {"http": None, "https": None}
     
-    retry = Retry(
-        total=5, read=5, connect=5, backoff_factor=1, 
-        status_forcelist=[429, 500, 502, 503, 504]
-    )
+    retry = Retry(total=5, read=5, connect=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     s.mount('http://', adapter)
     s.mount('https://', adapter)
     
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Connection": "close" # 防断联必加
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Connection": "close"
     })
     return s
 
@@ -66,8 +63,7 @@ TEMPLATE_FILE = "user_templates.json"
 DEFAULT_TEMPLATES = {
     "wencai_conditions": [
         "市盈率<20，市值>100亿，股息率>3%",
-        "市盈率<30，市值>50亿，非ST",
-        "市盈率<15，总市值>200亿"
+        "市盈率<30，市值>50亿，非ST"
     ],
     "ai_filter_prompts": [
         "过滤掉存在财务造假嫌疑、存贷双高、或者大股东质押率过高(>50%)的公司"
@@ -82,7 +78,7 @@ DEFAULT_TEMPLATES = {
 
 CONFIG = {
     "DEFAULT_HEADERS": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Connection": "close"
     }
 }
@@ -106,7 +102,7 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 免费开源接口获取模块 (本地快照缓存级降维打击)
+# 2. 免费开源接口获取模块
 # ==========================================
 class AkShareRetryEngine:
     @staticmethod
@@ -114,7 +110,7 @@ class AkShareRetryEngine:
         for func_idx, func in enumerate(funcs):
             for i in range(retries):
                 try:
-                    time.sleep(random.uniform(1.0, 2.5))
+                    time.sleep(random.uniform(1.0, 2.0))
                     res = func()
                     if isinstance(res, pd.DataFrame) and res.empty:
                         raise ValueError("接口返回空数据")
@@ -123,16 +119,15 @@ class AkShareRetryEngine:
                 except Exception as e:
                     err_msg = str(e).split(':', 1)[0] if ':' in str(e) else str(e)
                     if log_func:
-                        log_func(f"  ⚠️ [{task_name}] 受阻 (重试 {i+1}/{retries}). 原因: {err_msg}")
+                        if "Expecting value" in err_msg:
+                            log_func(f"  🔕 [{task_name}] 远端无此标的历史数据, 智能跳过。")
+                            break
+                        else:
+                            log_func(f"  ⚠️ [{task_name}] 受阻 (重试 {i+1}/{retries}). 原因: {err_msg}")
                     time.sleep(delay)
-            if log_func and func_idx < len(funcs) - 1:
-                log_func(f"  🔄 正在切换至备用数据源 {func_idx+2}...")
-                
-        if log_func: log_func(f"  ❌ [{task_name}] 接口最终响应失败，已返回安全空值。")
         return pd.DataFrame()
 
 class ApiDataEngine:
-    # 全局静态缓存池，一次拉取全市场数据，后续零网络请求！
     _full_market_df = None 
 
     @staticmethod
@@ -143,31 +138,26 @@ class ApiDataEngine:
         
         def _fetch_direct():
             import urllib.request
-            # 获取全市场股票（带 f100 行业字段）
             url = "http://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f20,f9,f100"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Connection': 'close'})
-            proxy_handler = urllib.request.ProxyHandler({})
-            opener = urllib.request.build_opener(proxy_handler)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(req, timeout=15) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 df = pd.DataFrame(data['data']['diff'])
                 df.rename(columns={'f12': '代码', 'f14': '名称', 'f2': '最新价', 'f20': '总市值', 'f9': '市盈率-动态', 'f100': '所属行业'}, inplace=True)
                 return df
 
-        def _fetch_em(): return ak.stock_zh_a_spot_em()
-            
-        df = AkShareRetryEngine.execute([_fetch_direct, _fetch_em], log_func, "获取全市场快照", retries, delay)
-        
+        df = AkShareRetryEngine.execute([_fetch_direct, ak.stock_zh_a_spot_em], log_func, "获取全市场快照", retries, delay)
         if df.empty: return []
         
         try:
             df['代码'] = df['代码'].astype(str).str.lower()
             df = df[~df['代码'].str.match(r'^(8|9|bj)', na=False)]
+            df = df[~df['名称'].str.contains('ST|退', na=False)]
+            df = df[~df['名称'].str.match(r'^[NCU]', na=False)]
             
-            # 【核心逻辑】：将清洗后的全市场数据放入本地内存池
             ApiDataEngine._full_market_df = df.copy()
 
-            # 本地执行条件解析
             if "市盈率<" in query or "pe<" in query.lower():
                 val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
                 df = df[(pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') > 0) & 
@@ -175,8 +165,6 @@ class ApiDataEngine:
             if "市值>" in query:
                 val = float(re.search(r'市值>(\d+)', query).group(1)) * 100000000
                 df = df[pd.to_numeric(df.get('总市值', 0), errors='coerce') > val]
-            if "非ST" in query:
-                df = df[~df['名称'].str.contains('ST', na=False)]
             if "非金融股" in query:
                 df = df[~df['名称'].str.contains('银行|证券|保险|信托', na=False)]
             
@@ -185,14 +173,9 @@ class ApiDataEngine:
             cleaned_data = []
             for _, row in df.iterrows():
                 code_str = str(row['代码']).lower()
-                if code_str.startswith('8') or code_str.startswith('9') or 'bj' in code_str:
-                    continue
                 cleaned_data.append({
-                    "代码": code_str.zfill(6), 
-                    "名称": str(row['名称']), 
-                    "总市值": row.get('总市值', 0), 
-                    "市盈率": row.get('市盈率-动态', 0),
-                    "所属行业": str(row.get('所属行业', '综合行业'))
+                    "代码": code_str.zfill(6), "名称": str(row['名称']), "总市值": row.get('总市值', 0), 
+                    "市盈率": row.get('市盈率-动态', 0), "所属行业": str(row.get('所属行业', '综合行业'))
                 })
             return cleaned_data
         except Exception as e:
@@ -201,23 +184,16 @@ class ApiDataEngine:
 
     @staticmethod
     def get_industry_competitors(stock_code, industry, ui_config, log_func):
-        """【降维打击】：直接在本地缓存池中进行 Pandas 筛选提取同行，0 网络请求！免疫断联！"""
-        if not industry or industry == "综合行业" or industry == "nan":
-            return [], "综合行业"
-            
+        if not industry or industry == "综合行业" or industry == "nan": return [], "综合行业"
         try:
             if ApiDataEngine._full_market_df is not None:
                 market_df = ApiDataEngine._full_market_df
-                # 在内存中过滤同行业，且排除自身
                 peers_df = market_df[(market_df['所属行业'] == industry) & (market_df['代码'] != stock_code)]
                 if not peers_df.empty:
-                    # 取同行业市值前三作为竞品
                     peers_df = peers_df.sort_values(by='总市值', ascending=False).head(3)
                     log_func(f"  ⚡ 已通过本地内存极速匹配 [{industry}] 同行，无需网络请求。")
                     return peers_df[['代码', '名称']].to_dict('records'), industry
-        except:
-            pass
-            
+        except: pass
         return [], industry
 
     @staticmethod
@@ -235,9 +211,10 @@ class ApiDataEngine:
                 valid_cols = [df.columns[0]]
                 for c in df.columns[1:]:
                     c_str = str(c).strip()
-                    if '12-31' in c_str or '1231' in c_str or re.match(r'^20\d{2}$', c_str):
+                    # 高宽容度日期提取（适配新浪随意格式）
+                    if re.search(r'20\d{2}', c_str):
                         try:
-                            yr = int(c_str[:4])
+                            yr = int(re.search(r'(20\d{2})', c_str).group(1))
                             if start_year <= yr <= end_year: valid_cols.append(c)
                         except: pass
                 if len(valid_cols) > 1:
@@ -245,36 +222,32 @@ class ApiDataEngine:
                     df_filtered.rename(columns={df_filtered.columns[0]: '项目'}, inplace=True)
                     sheets[s_name] = df_filtered
         
-        if not sheets:
-            log_func(f"  ⚠️️ {code} 财报解析为空 (可能为特殊格式报表)。")
-            
+        if not sheets: log_func(f"  ⚠ {code} 财报解析为空 (数据源无记录)。")
         return sheets
 
     @staticmethod
     def get_dividend_and_employee(code, ui_config, log_func):
-        retries = ui_config.get("ak_retries", 3)
-        delay = ui_config.get("ak_delay", 2)
         data = {'项目': ['员工总数', '近三年平均分红率'], '最新数据': [5000, "30%"]} 
-        
         def _div(): return ak.stock_history_dividend_detail(symbol=code)
-        div_df = AkShareRetryEngine.execute([_div], log_func, f"获取 {code} 分红明细", 2, delay)
+        div_df = AkShareRetryEngine.execute([_div], None, "", 1, 1)
         if not div_df.empty: data['最新数据'][1] = "35.5%" 
-        
         def _info(): return ak.stock_individual_info_em(symbol=code)
-        info_df = AkShareRetryEngine.execute([_info], log_func, f"获取 {code} 员工数", 2, delay)
+        info_df = AkShareRetryEngine.execute([_info], None, "", 1, 1)
         if not info_df.empty:
             try:
                 emp_row = info_df[info_df['item'].str.contains('员工', na=False)]
                 if not emp_row.empty: data['最新数据'][0] = emp_row['value'].values[0]
             except: pass
-            
         return pd.DataFrame(data)
 
     @staticmethod
     def get_cninfo_orgid(stock_code):
         url = "http://www.cninfo.com.cn/new/information/topSearch/query"
+        # 增加跨域与引用头，防止被巨潮隐性拦截
+        headers = CONFIG["DEFAULT_HEADERS"].copy()
+        headers.update({'Origin': 'http://www.cninfo.com.cn', 'Referer': 'http://www.cninfo.com.cn/new/index'})
         try:
-            res = requests.post(url, data={'keyWord': stock_code}, headers=CONFIG["DEFAULT_HEADERS"], timeout=10).json()
+            res = requests.post(url, data={'keyWord': stock_code}, headers=headers, timeout=10).json()
             for item in res:
                 if str(item.get('code', '')) == str(stock_code): return item.get('orgId')
         except: pass
@@ -290,24 +263,16 @@ class DataSelectionPipeline:
         log_func(f"🔎 开始数据海选 (基于 API 策略)...\n  条件: {wencai_cond}")
 
         data = ApiDataEngine.get_stock_screener_data(wencai_cond, ui_config, log_func)
-        if not data:
-            log_func("  ⚠️ API 策略未命中数据，启用备用核心蓝筹股池...")
-            data = [{"代码": "000001", "名称": "平安银行"}, {"代码": "600519", "名称": "贵州茅台"}]
-        
         extended_data = []
         seen = set()
         for item in data:
             if item['代码'] not in seen:
                 item['属性'] = '原查询标的'
                 ind = item.get("所属行业", "综合行业")
-                
-                # 直接通过本地缓存极速匹配，绝不触发网络拦截
                 peers, final_ind = ApiDataEngine.get_industry_competitors(item['代码'], ind, ui_config, log_func)
-                
                 item['所属行业'] = final_ind
                 extended_data.append(item)
                 seen.add(item['代码'])
-                
                 for p in peers:
                     if p['代码'] not in seen:
                         p['属性'] = '同行竞品'
@@ -327,6 +292,9 @@ class AnnualReportPipeline:
         start_y, end_y = ui_config["start_year"], ui_config["end_year"]
         log_func(f"📥 启动年报PDF下载与财务API全量提取，年份跨度: {start_y}-{end_y}")
 
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.cninfo.com.cn/new/index'})
+
         for item in stock_list_data:
             code = item["代码"]
             comp_name = item.get("名称", code)
@@ -334,6 +302,7 @@ class AnnualReportPipeline:
             comp_dir = os.path.join(out_dir, f"{ind}_{comp_name}_{code}")
             os.makedirs(comp_dir, exist_ok=True)
 
+            # PDF 下载增强版 (防止只有个别下载到的问题)
             orgid = ApiDataEngine.get_cninfo_orgid(code)
             if orgid:
                 query_url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
@@ -342,10 +311,10 @@ class AnnualReportPipeline:
                 if ui_config.get("dl_charter"): keywords.append("公司章程")
 
                 for kw in keywords:
-                    payload = {'pageNum': 1, 'pageSize': 10, 'tabName': 'fulltext', 'stock': f"{code},{orgid}", 'searchkey': kw, 'sdate': f"{start_y}-01-01", 'edate': f"{end_y}-12-31", 'category': 'category_ndbg_szsh'}
+                    payload = {'pageNum': 1, 'pageSize': 30, 'tabName': 'fulltext', 'stock': f"{code},{orgid}", 'searchkey': kw, 'sdate': f"{start_y}-01-01", 'edate': f"{end_y}-12-31", 'category': 'category_ndbg_szsh'}
                     try:
                         time.sleep(random.uniform(1.0, 2.0)) 
-                        res = requests.post(query_url, data=payload, headers=CONFIG["DEFAULT_HEADERS"], timeout=15).json()
+                        res = session.post(query_url, data=payload, timeout=15).json()
                         if res and res.get('announcements'):
                             for ann in res['announcements']:
                                 title = ann['announcementTitle']
@@ -355,13 +324,14 @@ class AnnualReportPipeline:
                                     safe_title = re.sub(r'[\\/:*?"<>|]', '', title)
                                     pdf_path = os.path.join(comp_dir, f"{safe_title}.pdf")
                                     if not os.path.exists(pdf_path):
-                                        pdf_data = requests.get(f"http://static.cninfo.com.cn/{adj_url}", headers=CONFIG["DEFAULT_HEADERS"], timeout=30).content
+                                        pdf_data = session.get(f"http://static.cninfo.com.cn/{adj_url}", timeout=30).content
                                         with open(pdf_path, 'wb') as f: f.write(pdf_data)
-                                        log_func(f"    ⬇️ 成功下载: {safe_title}.pdf")
+                                        log_func(f"    ⬇ 成功下载PDF: {safe_title}.pdf")
                                     break 
-                    except Exception: pass
+                    except Exception as e: 
+                        log_func(f"    ⚠️ {comp_name} PDF下载异常: {str(e)[:50]}")
 
-            log_func(f"    📊 正在通过接口获取 {comp_name} ({code}) 核心财务及员工分红数据...")
+            log_func(f"    📊 正在获取 {comp_name} ({code}) 核心财务表及分红数据...")
             fin_sheets = ApiDataEngine.fetch_financial_statements(code, start_y, end_y, ui_config, log_func)
             emp_div_df = ApiDataEngine.get_dividend_and_employee(code, ui_config, log_func)
             
@@ -380,98 +350,137 @@ class AnnualReportPipeline:
         log_func("✅ 年报与财务档案处理完毕")
         return out_dir
 
+# ==========================================
+# 4. 同业智能聚合量化排雷 (彻底重构)
+# ==========================================
 class FraudAndDim16Pipeline:
     @staticmethod
     def get_val(df, keywords, year_col):
-        if df.empty or year_col not in df.columns: return 0.0
+        """高容错财务数值提取器，自动清洗带有千分位符的脏数据"""
+        if df is None or df.empty or year_col not in df.columns: return 0.0
         for kw in keywords:
             mask = df['项目'].astype(str).str.replace(' ', '').str.contains(kw, na=False)
             if mask.any():
-                try: return float(str(df[mask].iloc[0][year_col]).replace(',', '').strip())
+                val = df[mask].iloc[0][year_col]
+                if pd.isna(val): continue
+                try:
+                    clean_str = re.sub(r'[^\d.-]', '', str(val))
+                    if clean_str == '' or clean_str == '-': return 0.0
+                    return float(clean_str)
                 except: pass
         return 0.0
 
     @staticmethod
     def run(in_dir, output_base, overwrite, log_func):
-        out_dir = prepare_clean_directory(os.path.join(output_base, "3_财务排雷与16维分析"), overwrite)
-        log_func(f"⚡ 开始执行严格的【18项财务造假排雷】与【16维综合分析矩阵】...")
+        out_dir = prepare_clean_directory(os.path.join(output_base, "3_行业横向对比与量化排雷"), overwrite)
+        log_func(f"⚡ 开始按行业执行【横向量化对比】与【造假排雷】...")
 
+        # 1. 解析所有下载好的公司文件，按行业分组
+        industry_groups = {} # ind -> list of comp data
         for root, dirs, files in os.walk(in_dir):
             for f in files:
                 if f.startswith("统一整合输出_") and f.endswith(".xlsx"):
                     file_path = os.path.join(root, f)
-                    parts = f.split('_')
-                    comp_name, comp_code = parts[1], parts[2]
+                    parts = root.split(os.sep)[-1].split('_') # 文件夹名为: 行业_名称_代码
+                    if len(parts) >= 3:
+                        ind, comp_name, comp_code = parts[-3], parts[-2], parts[-1]
+                        industry_groups.setdefault(ind, []).append({
+                            "name": comp_name, "code": comp_code, "path": file_path
+                        })
 
-                    try:
-                        xls = pd.ExcelFile(file_path)
-                        df_bs = pd.read_excel(xls, '合并资产负债表') if '合并资产负债表' in xls.sheet_names else pd.DataFrame()
-                        df_is = pd.read_excel(xls, '合并利润表') if '合并利润表' in xls.sheet_names else pd.DataFrame()
+        for ind, comps in industry_groups.items():
+            log_func(f"  🏢 正在聚合计算 [{ind}] 行业横向对比分析...")
+            
+            fraud_rows = []
+            dim16_rows = []
+            comp_names_list = []
 
-                        year_cols = [c for c in df_bs.columns if re.match(r'^20\d{2}', str(c))]
-                        year_cols.sort(reverse=True)
-                        y_curr = year_cols[0] if len(year_cols) > 0 else '2023'
-                        y_prev = year_cols[1] if len(year_cols) > 1 else '2022'
+            for comp in comps:
+                comp_name = comp["name"]
+                comp_names_list.append(comp_name)
+                try:
+                    xls = pd.ExcelFile(comp["path"])
+                    df_bs = pd.read_excel(xls, '合并资产负债表') if '合并资产负债表' in xls.sheet_names else pd.DataFrame()
+                    df_is = pd.read_excel(xls, '合并利润表') if '合并利润表' in xls.sheet_names else pd.DataFrame()
 
-                        fraud_results = []
-                        emp_curr, emp_prev = 5000, 5200 
-                        rev_curr = FraudAndDim16Pipeline.get_val(df_is, ["营业收入", "营业总收入"], y_curr)
-                        rev_prev = FraudAndDim16Pipeline.get_val(df_is, ["营业收入", "营业总收入"], y_prev)
-                        total_asset = max(FraudAndDim16Pipeline.get_val(df_bs, ["资产总计", "总资产"], y_curr), 1)
-                        ar = FraudAndDim16Pipeline.get_val(df_bs, ["应收账款", "应收票据"], y_curr)
-                        inv = FraudAndDim16Pipeline.get_val(df_bs, ["存货"], y_curr)
-                        fa = FraudAndDim16Pipeline.get_val(df_bs, ["固定资产"], y_curr)
-                        gw = FraudAndDim16Pipeline.get_val(df_bs, ["商誉"], y_curr)
-                        money = FraudAndDim16Pipeline.get_val(df_bs, ["货币资金", "交易性金融资产"], y_curr)
-                        debt = FraudAndDim16Pipeline.get_val(df_bs, ["短期借款", "长期借款", "应付债券"], y_curr)
+                    year_cols = [c for c in df_bs.columns if re.match(r'^20\d{2}', str(c))]
+                    year_cols.sort(reverse=True)
+                    y_curr = year_cols[0] if len(year_cols) > 0 else '2023'
+                    y_prev = year_cols[1] if len(year_cols) > 1 else '2022'
 
-                        rev_inc = (rev_curr - rev_prev) / max(rev_prev, 1)
-                        emp_drop = (emp_prev - emp_curr) / max(emp_prev, 1)
-                        
-                        c1_status = "风险" if emp_drop > 0.1 and rev_inc > 0.1 else "正常"
-                        fraud_results.append(["1. 员工人数减少但营收异常增加", c1_status])
-                        c7_status = "风险" if money/total_asset < 0.1 else "正常"
-                        fraud_results.append(["7. (货币资金+交易性金融)/总资产 < 10%", c7_status])
-                        c8_status = "风险" if ar/total_asset > 0.15 else "正常"
-                        fraud_results.append(["8. 应收账款/总资产 > 15%", c8_status])
-                        c9_status = "风险" if fa/total_asset > 0.40 else "正常"
-                        fraud_results.append(["9. 固定资产/总资产 > 40%", c9_status])
-                        c15_status = "风险" if (money/total_asset > 0.1) and (debt/total_asset > 0.1) else "正常"
-                        fraud_results.append(["15. 高存高贷双雷(货币及借款占比皆高)", c15_status])
-                        
-                        fraud_df = pd.DataFrame(fraud_results, columns=["造假排雷专项", "风控结果"])
+                    # 提取真实数值
+                    rev_curr = FraudAndDim16Pipeline.get_val(df_is, ["营业总收入", "营业收入"], y_curr)
+                    rev_prev = FraudAndDim16Pipeline.get_val(df_is, ["营业总收入", "营业收入"], y_prev)
+                    total_asset = max(FraudAndDim16Pipeline.get_val(df_bs, ["资产总计", "总资产"], y_curr), 1)
+                    ar = FraudAndDim16Pipeline.get_val(df_bs, ["应收账款", "应收票据"], y_curr)
+                    fa = FraudAndDim16Pipeline.get_val(df_bs, ["固定资产"], y_curr)
+                    gw = FraudAndDim16Pipeline.get_val(df_bs, ["商誉"], y_curr)
+                    money = FraudAndDim16Pipeline.get_val(df_bs, ["货币资金"], y_curr)
+                    debt = FraudAndDim16Pipeline.get_val(df_bs, ["短期借款", "长期借款", "应付债券"], y_curr)
+                    np_val = FraudAndDim16Pipeline.get_val(df_is, ["归属于母公司", "净利润"], y_curr)
 
-                        dim16_results = []
-                        dim16_results.append(["维度1: 总资产规模及成长性", "成长性好" if rev_inc > 0.1 else "成长性差", rev_curr])
-                        debt_ratio = FraudAndDim16Pipeline.get_val(df_bs, ["负债合计", "总负债"], y_curr) / total_asset
-                        dim16_results.append(["维度2: 资产负债率安全度", "安全" if debt_ratio < 0.6 else "淘汰", f"{debt_ratio*100:.1f}%"])
-                        ar_ratio = ar / total_asset
-                        dim16_results.append(["维度4: 应收占资产比率(产品畅销度)", "畅销(保留)" if ar_ratio < 0.15 else "难销(淘汰)", f"{ar_ratio*100:.1f}%"])
-                        dim16_results.append(["维度6: 投产类资产占比(主业专注度)", "专注主业" if gw/total_asset < 0.1 else "不专注", f"{gw/total_asset*100:.1f}%"])
-                        cost = FraudAndDim16Pipeline.get_val(df_is, ["营业成本"], y_curr)
-                        margin = (rev_curr - cost) / max(rev_curr, 1)
-                        dim16_results.append(["维度9: 毛利率竞争力", "强(保留)" if margin > 0.4 else "较差(淘汰)", f"{margin*100:.1f}%"])
-                        np_val = FraudAndDim16Pipeline.get_val(df_is, ["净利润", "归属于母公司"], y_curr)
-                        dim16_results.append(["维度14: 整体盈利能力(归母净利润)", "强" if np_val > 1e8 else "一般", np_val])
-                        dim16_results.append(["维度16: 现金分红股利支付率", "厚道且持续(保留)", "35%"])
+                    rev_inc = (rev_curr - rev_prev) / max(rev_prev, 1)
 
-                        dim16_df = pd.DataFrame(dim16_results, columns=["评估维度", "诊断评级", "核心指标值"])
+                    # 组织该公司的排雷结果字典 (项目 -> [标准, 数值/结论])
+                    comp_fraud = {
+                        "(1) (货币资金+交易性)/总资产 < 10%": ["< 10%", "风险" if money/total_asset < 0.1 else "正常"],
+                        "(2) 应收账款占总资产比例过大": ["> 15%", "风险" if ar/total_asset > 0.15 else "正常"],
+                        "(3) 固定资产比例过重": ["> 40%", "风险" if fa/total_asset > 0.40 else "正常"],
+                        "(4) 存贷双高(高账面现金且高负债)": ["均>15%", "风险" if (money/total_asset > 0.15) and (debt/total_asset > 0.15) else "正常"]
+                    }
+                    fraud_rows.append(comp_fraud)
 
-                        out_file = os.path.join(out_dir, f"{comp_name}_{comp_code}_排雷与16维诊断.xlsx")
-                        with pd.ExcelWriter(out_file, engine='openpyxl') as writer:
-                            fraud_df.to_excel(writer, sheet_name="18项造假排雷专项", index=False)
-                            dim16_df.to_excel(writer, sheet_name="16维度综合基本面", index=False)
+                    # 组织该公司的16维字典 (维度 -> [标准, 数据, 结论])
+                    debt_ratio = debt / total_asset
+                    ar_ratio = ar / total_asset
+                    gw_ratio = gw / total_asset
+                    margin = (rev_curr - FraudAndDim16Pipeline.get_val(df_is, ["营业成本"], y_curr)) / max(rev_curr, 1)
 
-                            red_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-                            ws_fraud = writer.sheets["18项造假排雷专项"]
-                            for row in ws_fraud.iter_rows(min_row=2):
-                                if row[1].value == "风险": row[1].fill, row[1].font = red_fill, Font(color="FF0000", bold=True)
-                            
-                        log_func(f"  ✅ 完成标的量化核算与打分: {comp_name} ({comp_code})")
-                    except Exception as e:
-                        log_func(f"  ⚠️️ 处理 {comp_name} 财务逻辑异常: {e}")
+                    comp_dim = {
+                        "维度1: 营收成长性": ["> 10%", f"{rev_inc*100:.1f}%", "优秀" if rev_inc > 0.1 else "一般"],
+                        "维度2: 有息负债率": ["< 40%", f"{debt_ratio*100:.1f}%", "安全" if debt_ratio < 0.4 else "风险"],
+                        "维度4: 应收占资产率": ["< 15%", f"{ar_ratio*100:.1f}%", "畅销" if ar_ratio < 0.15 else "难销"],
+                        "维度6: 商誉占资产比": ["< 10%", f"{gw_ratio*100:.1f}%", "专注" if gw_ratio < 0.1 else "爆雷预警"],
+                        "维度9: 毛利率分析": ["> 30%", f"{margin*100:.1f}%", "强" if margin > 0.3 else "较差"],
+                        "维度14: 归母净利润规模": ["> 1亿元", f"{np_val/1e8:.2f}亿", "强" if np_val > 1e8 else "一般"]
+                    }
+                    dim16_rows.append(comp_dim)
+                except: pass
 
-        log_func(f"📊 16维度分析与排雷矩阵生成完毕")
+            if not fraud_rows: continue
+
+            # 构建高专业度横向对比 DataFrame
+            final_fraud_data = []
+            for metric in fraud_rows[0].keys():
+                row = {"排雷检测项目": metric, "判定标准": fraud_rows[0][metric][0]}
+                for idx, c_name in enumerate(comp_names_list):
+                    row[f"{c_name}_定性结论"] = fraud_rows[idx].get(metric, ["", "缺失"])[1]
+                final_fraud_data.append(row)
+
+            final_dim_data = []
+            for metric in dim16_rows[0].keys():
+                row = {"综合评估维度": metric, "基准标准": dim16_rows[0][metric][0]}
+                for idx, c_name in enumerate(comp_names_list):
+                    val, rating = dim16_rows[idx].get(metric, ["", "无数据", "缺失"])[1:]
+                    row[f"{c_name}_核心数据"] = val
+                    row[f"{c_name}_定性评级"] = rating
+                final_dim_data.append(row)
+
+            out_file = os.path.join(out_dir, f"行业横向对比分析_{ind}.xlsx")
+            with pd.ExcelWriter(out_file, engine='openpyxl') as writer:
+                pd.DataFrame(final_fraud_data).to_excel(writer, sheet_name="造假排雷(同业对比)", index=False)
+                pd.DataFrame(final_dim_data).to_excel(writer, sheet_name="16维度基本面(同业对比)", index=False)
+
+                # 自动将所有包含“风险”或“淘汰”的单元格标红
+                red_font = Font(color="FF0000", bold=True)
+                for sheet_name in writer.sheets:
+                    ws = writer.sheets[sheet_name]
+                    for row in ws.iter_rows(min_row=2):
+                        for cell in row:
+                            if cell.value and isinstance(cell.value, str) and ("风险" in cell.value or "淘汰" in cell.value or "预警" in cell.value or "难销" in cell.value):
+                                cell.font = red_font
+                                
+        log_func(f"📊 同行业横向矩阵生成完毕，已输出至: {out_dir}")
         return out_dir
 
 class DeepValuationPipeline:
@@ -482,7 +491,7 @@ class DeepValuationPipeline:
             text = ""
             with open(pdf_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
-                for i in range(min(8, len(reader.pages))): text += reader.pages[i].extract_text() + "\n"
+                for i in range(min(6, len(reader.pages))): text += reader.pages[i].extract_text() + "\n"
             return text[:4000]
         except: return "【解析异常】"
 
@@ -493,8 +502,13 @@ class DeepValuationPipeline:
 
         companies = set()
         for root, dirs, files in os.walk(in_dir):
-            for f in files:
-                if "排雷与16维诊断" in f: companies.add(f.split('_')[0])
+            # 新版横向对比文件名为: 行业横向对比分析_白酒.xlsx
+            pass
+            
+        # 兼容读取所有处理过的公司
+        for r, d, f_list in os.walk(os.path.join(config["base_dir"], "2_报表下载与提取")):
+            parts = r.split(os.sep)[-1].split('_')
+            if len(parts) >= 3: companies.add(parts[-2])
 
         context_data = ""
         if config['engine'] == 'Tavily' and config['search_key']:
@@ -507,31 +521,28 @@ class DeepValuationPipeline:
 
         t_dir = os.path.join(val_dir, "1_智能深度研报")
         os.makedirs(t_dir, exist_ok=True)
-        log_func(f"🧠 [AI估值合成] 开始为各企业独立生成 MD&A 文本研报与企业护城河研报...")
+        log_func(f"🧠 [AI估值合成] 开始为各企业独立生成 AI 文本研报与企业研报...")
 
         client = OpenAI(api_key=config['api_key'] or "free", base_url=config['api_url'])
 
         for comp_name in companies:
             pdf_text = "年报数据摘要"
-            pdf_found = False
             for r, d, f_list in os.walk(os.path.join(config["base_dir"], "2_报表下载与提取")):
-                if pdf_found: break
                 if comp_name in r:
                     for f in f_list:
                         if f.endswith('.pdf'):
                             pdf_text = DeepValuationPipeline.extract_text_from_pdf(os.path.join(r, f))
-                            pdf_found = True
                             break
 
             txt_p = text_prompt.replace("【公司名称】", comp_name)
             try:
                 txt_resp = client.chat.completions.create(
                     model=config['api_model'],
-                    messages=[{"role": "user", "content": f"{txt_p}\n\n参考原件内容：\n{pdf_text}"}],
+                    messages=[{"role": "user", "content": f"{txt_p}\n\n请以 Markdown 格式输出。\n{pdf_text}"}],
                     temperature=0.3
                 )
                 doc1 = Document()
-                doc1.add_heading(f"{comp_name} - AI 财报与MD&A文本深度解析", 0)
+                doc1.add_heading(f"{comp_name} - AI 财报与文本深度解析", 0)
                 doc1.add_paragraph(txt_resp.choices[0].message.content)
                 doc1.save(os.path.join(t_dir, f"{comp_name}_AI文本分析研报.docx"))
                 log_func(f"    📄 成功生成: {comp_name} 文本研报")
@@ -548,7 +559,7 @@ class DeepValuationPipeline:
                 doc2 = Document()
                 doc2.add_heading(f"{comp_name} - 企业全维度战略与护城河评估", 0)
                 doc2.add_paragraph(ent_resp.choices[0].message.content)
-                doc2.save(os.path.join(t_dir, f"{comp_name}_企业分析研报.docx"))
+                doc2.save(os.path.join(t_dir, f"{comp_name}_企业综合分析研报.docx"))
                 log_func(f"    📈 成功生成: {comp_name} 企业分析研报")
             except Exception: pass
 
@@ -559,46 +570,34 @@ class DeepValuationPipeline:
             
             risk_free_rate = 2.5 
             sz_pe = 20.0
-            retries = config.get("ak_retries", 3)
-            delay = config.get("ak_delay", 2)
-            
             try:
-                def _bond(): return ak.bond_zh_us_rate()
-                bond_df = AkShareRetryEngine.execute([_bond], log_func, "获取中国10年期国债", retries, delay)
-                if not bond_df.empty:
-                    risk_free_rate = float(bond_df['中国国债收益率10年'].dropna().iloc[-1])
+                df_bond = ak.bond_china_yield(start_date=datetime.now().strftime("%Y0101"), end_date=datetime.now().strftime("%Y%m%d"))
+                if not df_bond.empty:
+                    risk_free_rate = float(df_bond['10年'].dropna().iloc[-1])
                     log_func(f"  💰 动态基准抓取成功: 中国10年国债收益率 {risk_free_rate}%")
                 
-                def _spot(): return ak.stock_zh_a_spot_em()
-                def _spot_sina(): return ak.stock_zh_a_spot()
-                spot_pe_df = AkShareRetryEngine.execute([_spot, _spot_sina], log_func, "获取A股大盘中位PE水位", retries, delay)
+                spot_pe_df = ak.stock_zh_a_spot_em()
                 if not spot_pe_df.empty:
                     sz_pe = float(spot_pe_df['市盈率-动态'].median()) if '市盈率-动态' in spot_pe_df.columns else 20.0
             except: pass
 
             good_price_results = []
-            
-            def _spot_full(): return ak.stock_zh_a_spot_em()
-            def _spot_full_sina(): return ak.stock_zh_a_spot()
-            spot_df = AkShareRetryEngine.execute([_spot_full, _spot_full_sina], log_func, "获取个股现价", retries, delay)
+            try: spot_df = ak.stock_zh_a_spot_em()
+            except: spot_df = pd.DataFrame()
             
             for comp_name in companies:
                 current_price = 15.60 
-                comp_pe = 50.0
+                comp_pe = 25.0
+                div_yield = 3.5 
                 
                 if not spot_df.empty:
-                    name_col = '名称' if '名称' in spot_df.columns else 'name'
-                    price_col = '最新价' if '最新价' in spot_df.columns else 'trade'
-                    pe_col = '市盈率-动态' if '市盈率-动态' in spot_df.columns else 'pb'
-                    
-                    row = spot_df[spot_df[name_col].str.contains(comp_name, na=False)]
+                    row = spot_df[spot_df['名称'].str.contains(comp_name, na=False)]
                     if not row.empty:
                         try:
-                            current_price = float(row.iloc[0][price_col])
-                            comp_pe = float(row.iloc[0][pe_col]) if pd.notna(row.iloc[0][pe_col]) else 50
+                            current_price = float(row.iloc[0]['最新价'])
+                            comp_pe = float(row.iloc[0]['市盈率-动态']) if pd.notna(row.iloc[0]['市盈率-动态']) else 25.0
                         except: pass
-                        
-                div_yield = 3.5 
+
                 judgment, color = "目前为观察区", "black"
                 if sz_pe < 20 and comp_pe < 15 and div_yield > risk_free_rate: judgment, color = "目前为好价格", "red"
                 elif sz_pe < 40 and comp_pe < 30 and div_yield > risk_free_rate * (2/3): judgment, color = "目前为偏买区", "yellow"
@@ -634,38 +633,20 @@ class DeepValuationPipeline:
         log_func(f"✅ 深度估值体系运行完毕，报告存入: {val_dir}")
         return val_dir
 
-# ==========================================
-# 4. 全局一键启动流水线调度器
-# ==========================================
 class OneClickOrchestrator:
     @staticmethod
     def run_all(ui_config, log_func):
         try:
             log_func("="*40)
-            log_func(f"🚀 开始执行全开源API金融量化分析流水线")
-            log_func(f"引擎: {ui_config['engine']} | 覆盖模式: {ui_config['overwrite']}")
+            log_func(f"🚀 开始执行金融智能量化分析流水线")
             base_dir = ui_config["base_dir"]
 
-            # 1. 数据海选 (纯API版)
             hs_dir, stock_list_data = DataSelectionPipeline.run(
-                ui_config["wencai"], 
-                ui_config["ai_filter"], 
-                ui_config["enable_ai_filter"], 
-                ui_config, 
-                log_func
+                ui_config["wencai"], ui_config["ai_filter"], ui_config["enable_ai_filter"], 
+                ui_config, log_func
             )
-
-            # 2. 报表下载与提取
-            report_dir = AnnualReportPipeline.run_download_and_extract(
-                stock_list_data, ui_config, log_func
-            )
-
-            # 3. 财务排雷与16维分析
-            eval_dir = FraudAndDim16Pipeline.run(
-                report_dir, base_dir, ui_config["overwrite"], log_func
-            )
-
-            # 4. AI深度估值与好价测算
+            report_dir = AnnualReportPipeline.run_download_and_extract(stock_list_data, ui_config, log_func)
+            eval_dir = FraudAndDim16Pipeline.run(report_dir, base_dir, ui_config["overwrite"], log_func)
             DeepValuationPipeline.run(
                 in_dir=eval_dir, out_dir=base_dir, text_prompt=ui_config["text_prompt"],
                 ent_prompt=ui_config["ent_prompt"], use_good_price=ui_config["good_price"],
