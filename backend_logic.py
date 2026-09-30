@@ -13,7 +13,9 @@ import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ==========================================
 # 【核心网络防劫持补丁】：强力清空代理环境变量
+# ==========================================
 for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]:
     os.environ.pop(key, None)
 
@@ -24,7 +26,7 @@ _original_session = requests.Session
 def get_global_robust_session():
     """强制注入高强度伪装与防代理劫持机制"""
     s = _original_session()
-    s.trust_env = False  # 无视系统及注册表代理
+    s.trust_env = False  # 终极杀手锏：无视系统及注册表代理，彻底防止劫持断联
     s.proxies = {"http": None, "https": None}
     
     retry = Retry(
@@ -104,7 +106,7 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 免费开源接口获取模块 (多源灾备)
+# 2. 免费开源接口获取模块 (本地快照缓存级降维打击)
 # ==========================================
 class AkShareRetryEngine:
     @staticmethod
@@ -121,95 +123,100 @@ class AkShareRetryEngine:
                 except Exception as e:
                     err_msg = str(e).split(':', 1)[0] if ':' in str(e) else str(e)
                     if log_func:
-                        log_func(f"  ⚠️ [{task_name}] 节点{func_idx+1}受阻 (重试 {i+1}/{retries}). 原因: {err_msg}")
+                        log_func(f"  ⚠️ [{task_name}] 受阻 (重试 {i+1}/{retries}). 原因: {err_msg}")
                     time.sleep(delay)
             if log_func and func_idx < len(funcs) - 1:
                 log_func(f"  🔄 正在切换至备用数据源 {func_idx+2}...")
                 
-        if log_func: log_func(f"  ❌ [{task_name}] 所有接口彻底失败，返回安全空值。")
+        if log_func: log_func(f"  ❌ [{task_name}] 接口最终响应失败，已返回安全空值。")
         return pd.DataFrame()
 
 class ApiDataEngine:
+    # 全局静态缓存池，一次拉取全市场数据，后续零网络请求！
+    _full_market_df = None 
+
     @staticmethod
     def get_stock_screener_data(query, ui_config, log_func):
-        log_func("  👉 启动底层 API 引擎进行数据海选 (完全脱离问财)...")
+        log_func("  👉 启动 API 引擎进行全市场数据快照提取...")
         retries = ui_config.get("ak_retries", 3)
         delay = ui_config.get("ak_delay", 2)
-
-        def _fetch_urllib():
+        
+        def _fetch_direct():
             import urllib.request
-            # 【核心优化】：增加了 f100 字段，一次性把全市场所有股票的“所属行业”全部抓回来！
+            # 获取全市场股票（带 f100 行业字段）
             url = "http://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f20,f9,f100"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Connection': 'close'})
             proxy_handler = urllib.request.ProxyHandler({})
             opener = urllib.request.build_opener(proxy_handler)
-            
             with opener.open(req, timeout=15) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 df = pd.DataFrame(data['data']['diff'])
-                # 把 f100 映射为 所属行业
                 df.rename(columns={'f12': '代码', 'f14': '名称', 'f2': '最新价', 'f20': '总市值', 'f9': '市盈率-动态', 'f100': '所属行业'}, inplace=True)
                 return df
 
-        # 使用高可用引擎包裹原生请求
-        df = AkShareRetryEngine.execute([_fetch_urllib], log_func, "获取A股实时快照与行业", retries, delay)
+        def _fetch_em(): return ak.stock_zh_a_spot_em()
+            
+        df = AkShareRetryEngine.execute([_fetch_direct, _fetch_em], log_func, "获取全市场快照", retries, delay)
         
         if df.empty: return []
-
+        
         try:
-            # 精准剔除北交所 (8、9开头)
             df['代码'] = df['代码'].astype(str).str.lower()
             df = df[~df['代码'].str.match(r'^(8|9|bj)', na=False)]
+            
+            # 【核心逻辑】：将清洗后的全市场数据放入本地内存池
+            ApiDataEngine._full_market_df = df.copy()
 
-            # 本地解析查询条件
+            # 本地执行条件解析
             if "市盈率<" in query or "pe<" in query.lower():
                 val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
-                df = df[(pd.to_numeric(df['市盈率-动态'], errors='coerce') > 0) & 
-                        (pd.to_numeric(df['市盈率-动态'], errors='coerce') < val)]
+                df = df[(pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') > 0) & 
+                        (pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') < val)]
             if "市值>" in query:
                 val = float(re.search(r'市值>(\d+)', query).group(1)) * 100000000
-                df = df[pd.to_numeric(df['总市值'], errors='coerce') > val]
+                df = df[pd.to_numeric(df.get('总市值', 0), errors='coerce') > val]
             if "非ST" in query:
                 df = df[~df['名称'].str.contains('ST', na=False)]
             if "非金融股" in query:
                 df = df[~df['名称'].str.contains('银行|证券|保险|信托', na=False)]
             
-            # 按照市值从大到小排序，选取头部标的
-            df = df.sort_values(by='总市值', ascending=False).head(10)
+            df = df.sort_values(by='总市值', ascending=False).head(10) if '总市值' in df.columns else df.head(10)
             
             cleaned_data = []
             for _, row in df.iterrows():
+                code_str = str(row['代码']).lower()
+                if code_str.startswith('8') or code_str.startswith('9') or 'bj' in code_str:
+                    continue
                 cleaned_data.append({
-                    "代码": str(row['代码']).zfill(6), 
+                    "代码": code_str.zfill(6), 
                     "名称": str(row['名称']), 
                     "总市值": row.get('总市值', 0), 
                     "市盈率": row.get('市盈率-动态', 0),
-                    "所属行业": str(row.get('所属行业', '综合行业')) # 携带行业信息返回
+                    "所属行业": str(row.get('所属行业', '综合行业'))
                 })
             return cleaned_data
         except Exception as e:
-            log_func(f"  ⚠️ 海选策略解析异常，启用备用池: {e}")
-            return [{"代码": "000858", "名称": "五粮液", "所属行业": "白酒"}, {"代码": "600519", "名称": "贵州茅台", "所属行业": "白酒"}]
+            log_func(f"  ⚠️ 本地策略解析异常: {e}")
+            return []
 
     @staticmethod
     def get_industry_competitors(stock_code, industry, ui_config, log_func):
-        """由于行业已经在海选时拿到，这里直接获取成分股，绕开容易报错的 individual_info 接口"""
+        """【降维打击】：直接在本地缓存池中进行 Pandas 筛选提取同行，0 网络请求！免疫断联！"""
         if not industry or industry == "综合行业" or industry == "nan":
             return [], "综合行业"
-
-        retries = ui_config.get("ak_retries", 3)
-        delay = ui_config.get("ak_delay", 2)
-        
-        def _peers(): return ak.stock_board_industry_cons_em(symbol=industry)
-        board_cons = AkShareRetryEngine.execute([_peers], log_func, f"获取 [{industry}] 同行成分股", retries, delay)
-        
-        if not board_cons.empty:
-            try:
-                board_cons['代码'] = board_cons['代码'].astype(str).str.lower()
-                valid_peers = board_cons[~board_cons['代码'].str.match(r'^(8|9|bj)', na=False)]
-                peers = valid_peers[valid_peers['代码'] != stock_code].head(3)
-                return peers[['代码', '名称']].to_dict('records'), industry
-            except Exception: pass
+            
+        try:
+            if ApiDataEngine._full_market_df is not None:
+                market_df = ApiDataEngine._full_market_df
+                # 在内存中过滤同行业，且排除自身
+                peers_df = market_df[(market_df['所属行业'] == industry) & (market_df['代码'] != stock_code)]
+                if not peers_df.empty:
+                    # 取同行业市值前三作为竞品
+                    peers_df = peers_df.sort_values(by='总市值', ascending=False).head(3)
+                    log_func(f"  ⚡ 已通过本地内存极速匹配 [{industry}] 同行，无需网络请求。")
+                    return peers_df[['代码', '名称']].to_dict('records'), industry
+        except:
+            pass
             
         return [], industry
 
@@ -239,7 +246,7 @@ class ApiDataEngine:
                     sheets[s_name] = df_filtered
         
         if not sheets:
-            log_func(f"  ⚠️ {code} 财报解析为空 (可能为特殊格式报表)。")
+            log_func(f"  ⚠️️ {code} 财报解析为空 (可能为特殊格式报表)。")
             
         return sheets
 
@@ -283,16 +290,20 @@ class DataSelectionPipeline:
         log_func(f"🔎 开始数据海选 (基于 API 策略)...\n  条件: {wencai_cond}")
 
         data = ApiDataEngine.get_stock_screener_data(wencai_cond, ui_config, log_func)
+        if not data:
+            log_func("  ⚠️ API 策略未命中数据，启用备用核心蓝筹股池...")
+            data = [{"代码": "000001", "名称": "平安银行"}, {"代码": "600519", "名称": "贵州茅台"}]
         
         extended_data = []
         seen = set()
         for item in data:
             if item['代码'] not in seen:
                 item['属性'] = '原查询标的'
-                
-                # 【极速提取】：直接使用海选携带回来的行业名，绕过极易报错的查询环节
                 ind = item.get("所属行业", "综合行业")
+                
+                # 直接通过本地缓存极速匹配，绝不触发网络拦截
                 peers, final_ind = ApiDataEngine.get_industry_competitors(item['代码'], ind, ui_config, log_func)
+                
                 item['所属行业'] = final_ind
                 extended_data.append(item)
                 seen.add(item['代码'])
@@ -458,7 +469,7 @@ class FraudAndDim16Pipeline:
                             
                         log_func(f"  ✅ 完成标的量化核算与打分: {comp_name} ({comp_code})")
                     except Exception as e:
-                        log_func(f"  ⚠️ 处理 {comp_name} 财务逻辑异常: {e}")
+                        log_func(f"  ⚠️️ 处理 {comp_name} 财务逻辑异常: {e}")
 
         log_func(f"📊 16维度分析与排雷矩阵生成完毕")
         return out_dir
@@ -640,7 +651,7 @@ class OneClickOrchestrator:
                 ui_config["wencai"], 
                 ui_config["ai_filter"], 
                 ui_config["enable_ai_filter"], 
-                ui_config,  # 传入字典本身
+                ui_config, 
                 log_func
             )
 
