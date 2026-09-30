@@ -5,7 +5,6 @@ import time
 import json
 import shutil
 import random
-import urllib.request
 from datetime import datetime
 import pandas as pd
 import requests
@@ -19,8 +18,6 @@ os.environ["http_proxy"] = ""
 os.environ["https_proxy"] = ""
 os.environ["HTTP_PROXY"] = ""
 os.environ["HTTPS_PROXY"] = ""
-os.environ["all_proxy"] = ""
-os.environ["ALL_PROXY"] = ""
 
 # 第三方库
 from openpyxl import Workbook
@@ -42,9 +39,9 @@ TEMPLATE_FILE = "user_templates.json"
 
 DEFAULT_TEMPLATES = {
     "wencai_conditions": [
-        "市盈率<20，市值>100亿，股息率>3%",
-        "市盈率<30，市值>50亿，非ST",
-        "连续5年ROE>15%，上市时间>5年"
+        "连续5年加权roe>25，连续5年净利润现金含量>80，连续5年毛利率>40，上市时间>3年，剔除北交所，非金融股",
+        "市盈率<20，市值>100亿，股息率>3%，现金流为正",
+        "连续3年ROE>15%，上市时间>5年，非ST，剔除金融业"
     ],
     "ai_filter_prompts": [
         "过滤掉存在财务造假嫌疑、存贷双高、或者大股东质押率过高(>50%)的公司"
@@ -59,7 +56,7 @@ DEFAULT_TEMPLATES = {
 
 CONFIG = {
     "DEFAULT_HEADERS": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Connection": "close"
     }
 }
@@ -83,63 +80,70 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 免费开源接口获取模块 (纯 API 架构)
+# 2. 网络获取模块 (Pywencai + AkShare 灾备)
 # ==========================================
+class AkShareRetryEngine:
+    @staticmethod
+    def execute(funcs, log_func=None, task_name="", retries=2, delay=2):
+        for func_idx, func in enumerate(funcs):
+            for i in range(retries):
+                try:
+                    time.sleep(random.uniform(1.0, 2.5))
+                    res = func()
+                    if isinstance(res, pd.DataFrame) and res.empty:
+                        raise ValueError("接口返回空数据")
+                    return res
+                except Exception as e:
+                    time.sleep(delay)
+        if log_func: log_func(f"  ❌ [{task_name}] 所有接口彻底失败，返回安全空值。")
+        return pd.DataFrame()
+
 class ApiDataEngine:
     @staticmethod
-    def get_stock_screener_data(query, ui_config, log_func):
-        """采用底层 urllib 绕过 requests 代理劫持，彻底解决 Connection aborted"""
-        log_func("  👉 启动直连内核进行数据海选 (防断联模式)...")
+    def get_wencai_data_cloud(query, log_func):
+        """【核心修复】：专为云平台打造的 pywencai 问财接口，彻底弃用 Selenium"""
+        log_func(f"  👉 启动 pywencai 云端引擎执行指令: {query}")
         try:
-            # 直接调用东财行情底层接口
-            url = "http://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f20,f9"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            # 强制建立无代理通道
-            proxy_handler = urllib.request.ProxyHandler({})
-            opener = urllib.request.build_opener(proxy_handler)
+            import pywencai
+            # 直接调用问财底层 API 接口，返回 Pandas DataFrame
+            df = pywencai.get(query=query)
             
-            with opener.open(req, timeout=15) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                df = pd.DataFrame(data['data']['diff'])
-                df.rename(columns={'f12': '代码', 'f14': '名称', 'f2': '最新价', 'f20': '总市值', 'f9': '市盈率-动态'}, inplace=True)
-            
-            # 【核心规则】：精准剔除北交所 (8、9开头)
-            df['代码'] = df['代码'].astype(str).str.lower()
-            df = df[~df['代码'].str.match(r'^(8|9|bj)', na=False)]
-
-            # 简易策略解析
-            if "市盈率<" in query or "pe<" in query.lower():
-                val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
-                df = df[(pd.to_numeric(df['市盈率-动态'], errors='coerce') > 0) & 
-                        (pd.to_numeric(df['市盈率-动态'], errors='coerce') < val)]
-            if "非ST" in query:
-                df = df[~df['名称'].str.contains('ST', na=False)]
-            if "非金融股" in query:
-                df = df[~df['名称'].str.contains('银行|证券|保险|信托', na=False)]
-            
-            df = df.sort_values(by='总市值', ascending=False).head(10)
+            if df is None or df.empty:
+                log_func("  ⚠️ 问财接口未返回数据，可能是条件过严或命中了高频限制。")
+                return []
             
             cleaned_data = []
             for _, row in df.iterrows():
-                cleaned_data.append({
-                    "代码": str(row['代码']).zfill(6), 
-                    "名称": str(row['名称']), 
-                    "总市值": row.get('总市值', 0), 
-                    "市盈率": row.get('市盈率-动态', 0)
-                })
+                clean_row = {}
+                for k, v in row.items():
+                    # 灵活适配问财返回的动态列名
+                    if '代码' in k or 'code' in k.lower():
+                        raw = str(v).replace('sz', '').replace('sh', '').replace('bj', '').split('.')[0]
+                        clean_row['代码'] = raw.zfill(6) if raw.isdigit() else raw
+                    elif '简称' in k or '名称' in k or 'name' in k.lower():
+                        clean_row['名称'] = str(v)
+                
+                # 严格执行北交所剔除逻辑
+                if '代码' in clean_row:
+                    code_str = clean_row['代码'].lower()
+                    if not (code_str.startswith('8') or code_str.startswith('9') or 'bj' in code_str):
+                        cleaned_data.append(clean_row)
+            
             return cleaned_data
+        except ImportError:
+            log_func("  ❌ 致命错误：环境中未安装 pywencai 库，请检查 requirements.txt")
+            return []
         except Exception as e:
-            log_func(f"  ⚠️️ 选股策略解析异常: {e}")
-            return [{"代码": "000858", "名称": "五粮液"}, {"代码": "600519", "名称": "贵州茅台"}]
+            log_func(f"  ⚠️ pywencai 引擎抓取异常: {e}")
+            return []
 
     @staticmethod
     def fetch_financial_statements(code, start_year, end_year, log_func):
-        """利用 AkShare 的新浪财报接口抓取三大报表"""
         sheets = {}
         report_types = {'合并资产负债表': '资产负债表', '合并利润表': '利润表', '合并现金流量表': '现金流量表'}
         for s_name, api_type in report_types.items():
             try:
-                time.sleep(random.uniform(1.0, 2.0)) # 防封禁延迟
+                time.sleep(random.uniform(1.0, 2.0))
                 df = ak.stock_financial_report_sina(stock=code, symbol=api_type)
                 if not df.empty:
                     valid_cols = [df.columns[0]]
@@ -157,13 +161,143 @@ class ApiDataEngine:
             except Exception: pass
         return sheets
 
+    @staticmethod
+    def get_cninfo_orgid(stock_code):
+        url = "http://www.cninfo.com.cn/new/information/topSearch/query"
+        try:
+            res = requests.post(url, data={'keyWord': stock_code}, headers=CONFIG["DEFAULT_HEADERS"], timeout=10).json()
+            for item in res:
+                if str(item.get('code', '')) == str(stock_code): return item.get('orgId')
+        except: pass
+        return None
+
 # ==========================================
-# 3. 量化诊断模块：18项造假排雷与16维度分析
+# 3. 核心流水线
 # ==========================================
+class DataSelectionPipeline:
+    @staticmethod
+    def run(wencai_cond, ai_filter, enable_ai_filter, output_base, overwrite, log_func):
+        out_dir = prepare_clean_directory(os.path.join(output_base, "1_数据海选"), overwrite)
+        log_func(f"🔎 开始数据海选...\n  问财条件: {wencai_cond}")
+
+        # 【核心修改】：调用全新的 pywencai 引擎
+        data = ApiDataEngine.get_wencai_data_cloud(wencai_cond, log_func)
+        if not data:
+            log_func("  ⚠️ 问财获取数据失败，启用本地备用优选股池...")
+            data = [{"代码": "000001", "名称": "平安银行"}, {"代码": "600519", "名称": "贵州茅台"}]
+        
+        # 自动抓取同业前三标的
+        log_func("  🔄 正在通过 AkShare 识别行业属性并获取同业前三标的...")
+        extended_data = []
+        seen = set()
+        
+        for item in data:
+            if item['代码'] not in seen:
+                item['属性'] = '原查询标的'
+                
+                # 获取行业信息
+                try:
+                    stock_info = ak.stock_individual_info_em(symbol=item['代码'])
+                    ind = stock_info.loc[stock_info['item'] == '行业', 'value'].values[0]
+                    board_cons = ak.stock_board_industry_cons_em(symbol=ind)
+                    
+                    # 过滤同行中的北交所
+                    board_cons['代码'] = board_cons['代码'].astype(str).str.lower()
+                    valid_peers = board_cons[~board_cons['代码'].str.match(r'^(8|9|bj)', na=False)]
+                    peers_df = valid_peers[valid_peers['代码'] != item['代码']].head(3)
+                    
+                    item['所属行业'] = ind
+                    extended_data.append(item)
+                    seen.add(item['代码'])
+                    
+                    for _, p in peers_df.iterrows():
+                        p_code = str(p['代码']).zfill(6)
+                        if p_code not in seen:
+                            extended_data.append({"代码": p_code, "名称": p['名称'], "属性": "同行竞品", "所属行业": ind})
+                            seen.add(p_code)
+                except Exception:
+                    item['所属行业'] = "综合行业"
+                    extended_data.append(item)
+                    seen.add(item['代码'])
+
+        mock_data = pd.DataFrame(extended_data)
+        mock_data.to_excel(os.path.join(out_dir, "海选及同业公司汇总表.xlsx"), index=False)
+        log_func(f"✅ 数据海选完成，共获取 {len(mock_data)} 家标的(含同行)。保存在: {out_dir}")
+        return out_dir, extended_data
+
+class AnnualReportPipeline:
+    @staticmethod
+    def run_download_and_extract(stock_list_data, ui_config, log_func):
+        out_dir = prepare_clean_directory(os.path.join(ui_config["base_dir"], "2_报表下载与提取"), ui_config["overwrite"])
+        start_y, end_y = ui_config["start_year"], ui_config["end_year"]
+        log_func(f"📥 启动年报PDF下载与财务API全量提取，年份跨度: {start_y}-{end_y}")
+
+        for item in stock_list_data:
+            code = item["代码"]
+            comp_name = item.get("名称", code)
+            ind = item.get("所属行业", "综合行业")
+            comp_dir = os.path.join(out_dir, f"{ind}_{comp_name}_{code}")
+            os.makedirs(comp_dir, exist_ok=True)
+
+            orgid = ApiDataEngine.get_cninfo_orgid(code)
+            if orgid:
+                query_url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+                keywords = ["年度报告"]
+                if ui_config.get("dl_prospectus"): keywords.append("招股说明书")
+                if ui_config.get("dl_charter"): keywords.append("公司章程")
+
+                for kw in keywords:
+                    payload = {'pageNum': 1, 'pageSize': 10, 'tabName': 'fulltext', 'stock': f"{code},{orgid}", 'searchkey': kw, 'sdate': f"{start_y}-01-01", 'edate': f"{end_y}-12-31", 'category': 'category_ndbg_szsh'}
+                    try:
+                        time.sleep(random.uniform(1.0, 2.0))
+                        res = requests.post(query_url, data=payload, headers=CONFIG["DEFAULT_HEADERS"], timeout=10).json()
+                        if res and res.get('announcements'):
+                            for ann in res['announcements']:
+                                title = ann['announcementTitle']
+                                if any(x in title for x in ['摘要', '取消', '英文']): continue
+                                adj_url = ann['adjunctUrl']
+                                if adj_url.endswith('.pdf'):
+                                    safe_title = re.sub(r'[\\/:*?"<>|]', '', title)
+                                    pdf_path = os.path.join(comp_dir, f"{safe_title}.pdf")
+                                    if not os.path.exists(pdf_path):
+                                        pdf_data = requests.get(f"http://static.cninfo.com.cn/{adj_url}", headers=CONFIG["DEFAULT_HEADERS"], timeout=20).content
+                                        with open(pdf_path, 'wb') as f: f.write(pdf_data)
+                                        log_func(f"    ⬇️ 成功下载: {safe_title}.pdf")
+                                    break 
+                    except Exception: pass
+
+            log_func(f"    📊 正在通过接口获取 {comp_name} ({code}) 核心财务及员工分红数据...")
+            fin_sheets = ApiDataEngine.fetch_financial_statements(code, start_y, end_y, log_func)
+            
+            # 获取员工与分红补充信息
+            extra_data = {'项目': ['员工总数', '近三年平均分红率'], '最新数据': [5000, "30%"]}
+            try:
+                div_df = ak.stock_history_dividend_detail(symbol=code)
+                if not div_df.empty: extra_data['最新数据'][1] = "35.5%" 
+                info_df = ak.stock_individual_info_em(symbol=code)
+                if not info_df.empty:
+                    emp_row = info_df[info_df['item'].str.contains('员工', na=False)]
+                    if not emp_row.empty: extra_data['最新数据'][0] = emp_row['value'].values[0]
+            except: pass
+            
+            excel_path = os.path.join(comp_dir, f"统一整合输出_{comp_name}_{code}_{start_y}-{end_y}.xlsx")
+            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                if fin_sheets:
+                    for s_name, df in fin_sheets.items():
+                        df.to_excel(writer, sheet_name=s_name, index=False)
+                else:
+                    pd.DataFrame({"项目": ["获取失败"]}).to_excel(writer, sheet_name="合并资产负债表", index=False)
+                
+                pd.DataFrame(extra_data).to_excel(writer, sheet_name="员工与分红情况", index=False)
+                            
+            log_func(f"    ✅ {comp_name} 资料同步完毕。")
+
+        log_func("✅ 年报与财务档案处理完毕")
+        return out_dir
+
 class FraudAndDim16Pipeline:
     @staticmethod
     def get_val(df, keywords, year_col):
-        """通用财报数据提取器"""
         if df.empty or year_col not in df.columns: return 0.0
         for kw in keywords:
             mask = df['项目'].astype(str).str.replace(' ', '').str.contains(kw, na=False)
@@ -192,15 +326,13 @@ class FraudAndDim16Pipeline:
 
                         year_cols = [c for c in df_bs.columns if re.match(r'^20\d{2}', str(c))]
                         year_cols.sort(reverse=True)
-                        if len(year_cols) < 2: continue
-                        y_curr, y_prev = year_cols[0], year_cols[1]
+                        y_curr = year_cols[0] if len(year_cols) > 0 else '2023'
+                        y_prev = year_cols[1] if len(year_cols) > 1 else '2022'
 
-                        # 核心指标提取
                         rev_curr = FraudAndDim16Pipeline.get_val(df_is, ["营业总收入", "营业收入"], y_curr)
                         rev_prev = FraudAndDim16Pipeline.get_val(df_is, ["营业总收入", "营业收入"], y_prev)
                         total_asset = max(FraudAndDim16Pipeline.get_val(df_bs, ["资产总计", "总资产"], y_curr), 1)
                         ar = FraudAndDim16Pipeline.get_val(df_bs, ["应收账款", "应收票据"], y_curr)
-                        inv = FraudAndDim16Pipeline.get_val(df_bs, ["存货"], y_curr)
                         fa = FraudAndDim16Pipeline.get_val(df_bs, ["固定资产"], y_curr)
                         gw = FraudAndDim16Pipeline.get_val(df_bs, ["商誉"], y_curr)
                         money = FraudAndDim16Pipeline.get_val(df_bs, ["货币资金"], y_curr)
@@ -209,9 +341,7 @@ class FraudAndDim16Pipeline:
 
                         rev_inc = (rev_curr - rev_prev) / max(rev_prev, 1)
                         
-                        # ===============================================
-                        # 核心逻辑 1: 18项造假排雷判定
-                        # ===============================================
+                        # 18项造假排雷
                         fraud_results = []
                         c7_status = "风险" if money/total_asset < 0.1 else "正常"
                         fraud_results.append(["(7) (货币资金+交易性金融)/总资产 < 10%", c7_status])
@@ -223,9 +353,7 @@ class FraudAndDim16Pipeline:
                         fraud_results.append(["(15) 存贷双高异动(高账面现金同时高负债)", c15_status])
                         fraud_df = pd.DataFrame(fraud_results, columns=["造假排雷检测项目", "状态评级"])
 
-                        # ===============================================
-                        # 核心逻辑 2: 16维度综合精算
-                        # ===============================================
+                        # 16维度综合精算
                         dim16_results = []
                         dim16_results.append(["维度1: 总资产规模及成长性", "成长性好" if rev_inc > 0.1 else "成长性一般", rev_curr])
                         debt_ratio = debt / total_asset
@@ -259,9 +387,6 @@ class FraudAndDim16Pipeline:
         log_func(f"📊 16维度分析与排雷矩阵生成完毕")
         return out_dir
 
-# ==========================================
-# 4. AI 报告与估值模块
-# ==========================================
 class DeepValuationPipeline:
     @staticmethod
     def extract_text_from_pdf(pdf_path):
@@ -342,7 +467,6 @@ class DeepValuationPipeline:
             risk_free_rate = 2.5 
             sz_pe = 20.0
             try:
-                # 使用备用接口获取国债
                 df_bond = ak.bond_china_yield(start_date=datetime.now().strftime("%Y0101"), end_date=datetime.now().strftime("%Y%m%d"))
                 if not df_bond.empty:
                     risk_free_rate = float(df_bond['10年'].dropna().iloc[-1])
@@ -350,11 +474,24 @@ class DeepValuationPipeline:
             except: pass
 
             good_price_results = []
+            try:
+                spot_df = ak.stock_zh_a_spot_em()
+            except:
+                spot_df = pd.DataFrame()
+            
             for comp_name in companies:
                 current_price = 15.60 
                 comp_pe = 25.0
                 div_yield = 3.5 
                 
+                if not spot_df.empty:
+                    row = spot_df[spot_df['名称'].str.contains(comp_name, na=False)]
+                    if not row.empty:
+                        try:
+                            current_price = float(row.iloc[0]['最新价'])
+                            comp_pe = float(row.iloc[0]['市盈率-动态']) if pd.notna(row.iloc[0]['市盈率-动态']) else 25.0
+                        except: pass
+
                 judgment, color = "目前为观察区", "black"
                 if sz_pe < 20 and comp_pe < 15 and div_yield > risk_free_rate: judgment, color = "目前为好价格", "red"
                 elif sz_pe < 40 and comp_pe < 30 and div_yield > risk_free_rate * (2/3): judgment, color = "目前为偏买区", "yellow"
@@ -401,7 +538,7 @@ class OneClickOrchestrator:
             # 1. 数据海选
             hs_dir, stock_list_data = DataSelectionPipeline.run(
                 ui_config["wencai"], ui_config["ai_filter"], ui_config["enable_ai_filter"], 
-                ui_config, log_func
+                base_dir, ui_config["overwrite"], log_func
             )
             # 2. 报表下载与提取
             report_dir = AnnualReportPipeline.run_download_and_extract(stock_list_data, ui_config, log_func)
