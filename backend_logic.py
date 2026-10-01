@@ -92,7 +92,7 @@ def prepare_clean_directory(dir_path: str, overwrite: bool):
     return dir_path
 
 # ==========================================
-# 2. 核心引擎 (问财+快照 双核智能降级版)
+# 2. 核心引擎 (双核智能穿透版)
 # ==========================================
 class CninfoOrgCache:
     _org_map = {}
@@ -118,7 +118,7 @@ class ApiDataEngine:
         # --- 核心1：优先尝试问财智能语义解析 ---
         try:
             import pywencai
-            log_func("  🔍 [引擎1] 正在唤醒问财语义模型(如果云端被拦截将自动降级)...")
+            log_func("  🔍 [引擎1] 正在唤醒问财语义模型(如果被拦截将自动降级)...")
             
             df_wencai = None
             for _ in range(2):
@@ -143,45 +143,54 @@ class ApiDataEngine:
                         if not (code_str.startswith('8') or code_str.startswith('9') or 'bj' in code_str):
                             cleaned_data.append(clean_row)
                 if cleaned_data:
-                    log_func(f"  ✅ [引擎1] 问财执行成功，精准锁定 {len(cleaned_data)} 家。")
+                    log_func(f"  ✅ [引擎1] 问财执行成功，精准锁定 {len(cleaned_data)} 家标的。")
                     return cleaned_data
-            log_func("  ⚠️ [引擎1] 问财无数据返回，判断云端 IP 触发了滑块拦截。")
+            log_func("  ⚠️ [引擎1] 问财未返回数据，触发滑块拦截。")
         except ImportError:
-            log_func("  ⚠️ [引擎1] 环境缺失 pywencai。")
+            log_func("  ⚠️ [引擎1] 环境缺失 pywencai，请检查 requirements.txt 是否添加。")
         except Exception as e:
             log_func(f"  ⚠️ [引擎1] 问财引擎受阻: {str(e).split(':')[0]}")
 
-        # --- 核心2：基础快照兜底（防断链） ---
-        log_func("  🔄 [引擎2] 自动激活全市场快照兜底 (复杂指标退化为蓝筹过滤)...")
+        # --- 核心2：底层 urllib 直连免拦截快照兜底 ---
+        log_func("  🔄 [引擎2] 自动激活全市场快照兜底 (绕过底层拦截架构)...")
         try:
-            df = ak.stock_zh_a_spot_em()
+            import urllib.request
+            url = "http://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f20,f9,f100"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+            # 强行绕过所有云端代理，建立底层直连通道，根治 Connection aborted
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=15) as r:
+                data = json.loads(r.read().decode('utf-8'))
+                df = pd.DataFrame(data['data']['diff'])
+                df.rename(columns={'f12': '代码', 'f14': '名称', 'f20': '总市值', 'f9': '市盈率-动态', 'f100': '所属行业'}, inplace=True)
+            
             if df.empty:
-                log_func("  ❌ [引擎2] 东方财富接口阻断！")
-                return []
+                raise ValueError("底层通道返回数据为空")
 
             df['代码'] = df['代码'].astype(str).str.zfill(6)
             df = df[~df['代码'].str.match(r'^(8|9|bj)')]
             df = df[~df['名称'].str.contains('ST|退|^N|^C|^U', regex=True, na=False)]
             ApiDataEngine._full_market_df = df.copy()
 
+            # 兼容筛选逻辑
             if "市盈率<" in query or "pe<" in query.lower():
                 val = float(re.search(r'市盈率<(\d+)', query).group(1)) if "市盈率<" in query else 20
                 df = df[(pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') > 0) & 
                         (pd.to_numeric(df.get('市盈率-动态', 0), errors='coerce') < val)]
             
-            df = df.sort_values(by='总市值', ascending=False).head(5) # 兜底取头5家
+            df = df.sort_values(by='总市值', ascending=False).head(5) # 兜底获取头5家
             
             cleaned_data = []
             for _, row in df.iterrows():
                 cleaned_data.append({
                     "代码": str(row['代码']), "名称": str(row['名称']), 
                     "总市值": row.get('总市值', 0), "市盈率": row.get('市盈率-动态', 0), 
-                    "所属行业": "综合行业"
+                    "所属行业": str(row.get('所属行业', '综合行业'))
                 })
-            log_func(f"  ✅ [引擎2] 快照兜底成功，抓取头部 {len(cleaned_data)} 家优质标的。")
+            log_func(f"  ✅ [引擎2] 直连兜底成功，抓取优质头部 {len(cleaned_data)} 家。")
             return cleaned_data
         except Exception as e:
-            log_func(f"  ❌ [引擎2] 兜底异常: {e}")
+            log_func(f"  ❌ [引擎2] 兜底防御网异常: {e}")
             return []
 
     @staticmethod
@@ -227,7 +236,7 @@ class ApiDataEngine:
                             df_filtered.columns = new_cols
                             sheets[s_name] = df_filtered
                         break 
-                except Exception as e:
+                except Exception:
                     pass
         return sheets
 
@@ -273,7 +282,7 @@ class DataSelectionPipeline:
                         seen.add(p['代码'])
 
         pd.DataFrame(extended_data).to_excel(os.path.join(out_dir, "海选汇总表.xlsx"), index=False)
-        log_func(f"✅ 海选完成，扩展至 {len(extended_data)} 家。")
+        log_func(f"✅ 海选完成，自动扩展竞品至 {len(extended_data)} 家。")
         return out_dir, extended_data
 
 class AnnualReportPipeline:
@@ -465,7 +474,7 @@ class DeepValuationPipeline:
                 doc1.add_paragraph(resp.choices[0].message.content)
                 doc1.save(os.path.join(val_dir, f"{comp_name}_AI文本研报.docx"))
                 log_func(f"    📄 生成: {comp_name} AI研报")
-            except Exception as e: pass
+            except Exception: pass
 
         if use_good_price:
             log_func(f"📉 [好价模型] 执行估值测算...")
