@@ -1,10 +1,28 @@
-streamlit>=1.32.0
-pandas>=2.0.0
-akshare>=1.13.0
-requests>=2.31.0
-openpyxl>=3.1.2
-python-docx>=1.1.0
-openai>=1.13.0
-tavily-python>=0.3.3
-PyPDF2>=3.0.1
-pywencai>=0.9.11
+# 价值投资智能分析模型 · 云端版（Streamlit + FastAPI）
+#
+# 说明：Streamlit Community Cloud 会安装本文件；FastAPI/uvicorn 供后端模式使用。
+# 若只想跑前端，可注释掉 fastapi/uvicorn 两行以减少安装时间。
+
+# ---- 前端（Streamlit 云端必需）----
+streamlit>=1.36
+# ---- 数据与计算 ----
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
+requests>=2.31
+python-docx>=1.1
+
+# ---- 免费数据源 ----
+akshare>=1.14
+baostock>=0.8.9 ; python_version >= "3.8"      # 备用源，未安装会自动跳过
+tushare>=1.4.6                                 # 可选，需 token（默认关闭）
+
+# ---- 后端 API（仅 API 模式需要）----
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+
+# ---- AI 企业深度分析 ----
+openai>=1.30
+duckduckgo-search>=6.1 ; python_version >= "3.8"
+ddgs>=9.0 ; python_version >= "3.12"
