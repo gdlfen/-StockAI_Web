@@ -625,13 +625,17 @@ def write_unified_excel(sheets: Dict[str, pd.DataFrame], out_dir: str, name: str
 
 def build_attribute_table(rep: Dict[str, Any], industry_info: Dict[str, str]) -> pd.DataFrame:
     """《1_{代表公司}_公司属性表.xlsx》——列名与契约一致（下游按“目标股票/二级行业”读取）。"""
+    # clean_str：行业取不到时写空串而不是 NaN，否则下游 str(nan) == "nan"
+    # 会一路传成“行业: nan”，导致 16 维度报告文件名出现 _nan_。
+    from .universe import clean_str
+    info = {k: clean_str(v) for k, v in (industry_info or {}).items()}
     return pd.DataFrame([{
         "目标股票": rep.get("code", ""),
         "股票简称": rep.get("name", ""),
-        "一级行业": industry_info.get("一级行业", ""),
-        "二级行业": industry_info.get("二级行业", ""),
-        "三级行业": industry_info.get("三级行业", ""),
-        "完整行业路径": industry_info.get("完整行业路径", ""),
+        "一级行业": info.get("一级行业", ""),
+        "二级行业": info.get("二级行业", ""),
+        "三级行业": info.get("三级行业", ""),
+        "完整行业路径": info.get("完整行业路径", ""),
     }], columns=ATTR_COLUMNS)
 
 

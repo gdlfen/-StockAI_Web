@@ -148,17 +148,112 @@ class StockUniverse:
 _IND_FAIL_STREAK = {"n": 0, "skip_em": False}
 _IND_FAIL_LIMIT = 3
 
+# 东财行业接口的单次超时：原来 8s×2 次（最坏 ~16s），实测该接口在云环境经常整体超时，
+# 故压到 5s 且不重试。可用环境变量 VIM_EM_INDUSTRY_TIMEOUT 调整。
+def _em_timeout() -> int:
+    try:
+        return max(2, int(os.environ.get("VIM_EM_INDUSTRY_TIMEOUT", "5")))
+    except Exception:  # noqa: BLE001
+        return 5
+
+
+_EM_TIMEOUT = _em_timeout()
+
+# pandas 的缺失值被 str() 后会变成这些字样，必须当空串处理
+_NA_TOKENS = {"", "nan", "none", "null", "nat", "-", "—", "<na>"}
+
+
+def clean_str(v: Any) -> str:
+    """把任意值规范成「干净的字符串」：NaN/None/'nan' → ''。"""
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and v != v:      # NaN
+            return ""
+    except Exception:
+        pass
+    s = str(v).strip()
+    return "" if s.lower() in _NA_TOKENS else s
+
+
+def _industry_from_cninfo(code: str, timeout: int = 10) -> Dict[str, str]:
+    """巨潮（中上协）行业分类。实测每只约 0.4 秒，稳定不超时。
+
+    列名与实际内容对应关系（实测 600887 / 605499 / 603156）：
+        行业门类 = 制造业            → 一级
+        行业大类 = 食品制造业        → 二级（**真正的行业**）
+        行业中类 / 行业次类 = nan    → 常为空，只作补充
+    """
+    out = {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
+    try:
+        import akshare as ak
+        df = ak.stock_industry_change_cninfo(symbol=code, start_date="20000101",
+                                            end_date=time.strftime("%Y%m%d"))
+        if df is None or df.empty:
+            return out
+        row = df.iloc[-1]
+        for src, dst in (("行业门类", "一级行业"),
+                         ("行业大类", "二级行业"),
+                         ("行业中类", "三级行业"),
+                         ("行业次类", "三级行业")):
+            val = clean_str(row.get(src))
+            if val and not out.get(dst):
+                out[dst] = val
+        out["完整行业路径"] = "-".join(
+            [x for x in (out["一级行业"], out["二级行业"], out["三级行业"]) if x])
+    except Exception:  # noqa: BLE001
+        return {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
+    return out
+
+
+def _industry_from_eastmoney(code: str, log, retries: int = 1, timeout: int = 8) -> Dict[str, str]:
+    """东方财富 F10 行业分类（分级最细，但 datacenter 会间歇性超时）。"""
+    out: Dict[str, str] = {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
+    secucode = (f"{code}.SH" if code[0] in ("6", "9")
+                else (f"{code}.BJ" if code[0] in ("4", "8") else f"{code}.SZ"))
+    r = http_get(EM_DATACENTER, params={
+        "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
+        "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,BOARD_NAME,BOARD_CODE,BOARD_TYPE,BOARD_RANK",
+        "filter": f'(SECUCODE="{secucode}")',
+        "pageNumber": 1, "pageSize": 200, "source": "WEB", "client": "WEB",
+    }, timeout=timeout, retries=retries, label=f"东财行业[{code}]", log=log)
+    rows = []
+    if r is not None:
+        rows = (((r.json() or {}).get("result") or {}).get("data")) or []
+    ranked: List[Tuple[int, str]] = []
+    for it in rows:
+        name = clean_str(it.get("BOARD_NAME"))
+        rank = safe_float(it.get("BOARD_RANK"))
+        if name:
+            ranked.append((int(rank) if rank else 99, name))
+    if ranked:
+        ranked.sort(key=lambda x: x[0])
+        names = [n for _, n in ranked]
+        out["一级行业"] = names[0] if len(names) > 0 else ""
+        out["二级行业"] = names[1] if len(names) > 1 else out["一级行业"]
+        out["三级行业"] = names[2] if len(names) > 2 else out["二级行业"]
+        out["完整行业路径"] = "-".join([n for n in names[:3] if n])
+    return out
+
 
 def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None]] = None,
-                 retries: int = 1, timeout: int = 8) -> Dict[str, str]:
+                 retries: int = 1, timeout: int = 8,
+                 prefer: Optional[str] = None) -> Dict[str, str]:
     """取单只股票的行业信息。返回
     {"一级行业":..., "二级行业":..., "三级行业":..., "完整行业路径":...}
 
-    容错设计（针对东财 datacenter 频繁超时）：
+    **默认数据源顺序：巨潮优先 → 东财兜底**（可用环境变量
+    ``VIM_INDUSTRY_SOURCE=eastmoney`` 切回东财优先）。
+
+    为什么默认巨潮优先：东财 ``datacenter-web`` 在部分网络/云环境下**频繁 ReadTimeout**
+    （每次白等 8~16 秒），而巨潮实测每只约 0.4 秒且几乎不失败；两者都是中上协/证监会口径，
+    取到的“二级行业”同级可比（如 600887 均为「食品制造业」）。
+
+    容错：
     1. 命中缓存直接返回；
-    2. 东财接口超时/失败时**写入短期负缓存**，避免同一只股票在本轮反复重试；
-    3. 连续失败达 `_IND_FAIL_LIMIT` 次后，本轮直接跳过东财、走巨潮回退（每次约 0.3s）；
-    4. 全部失败返回空 dict，由调用方用“默认行业”兜底，**绝不阻塞主流程**。
+    2. 单个源失败即换另一个源；
+    3. 全部失败写入短期负缓存，同一只股票本轮不再重复请求；
+    4. 最终仍失败返回空行业，由调用方用“默认行业”兜底，**绝不阻塞主流程**。
     """
     log = log or make_logger()
     code = str(code).zfill(6)
@@ -168,74 +263,71 @@ def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None
         return hit
     # 短期负缓存：同一只股票本轮不再重复请求
     if cache.get(f"industry_fail_{code}"):
-        neg = cache.get(key)
-        if isinstance(neg, dict):
-            return neg
         return {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
 
+    prefer = (prefer or os.environ.get("VIM_INDUSTRY_SOURCE") or "").strip().lower()
     result: Dict[str, str] = {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
 
-    # ① 东方财富 F10（分级最清晰，但可能超时）
-    if not _IND_FAIL_STREAK["skip_em"]:
-        try:
-            secucode = (f"{code}.SH" if code[0] in ("6", "9")
-                        else (f"{code}.BJ" if code[0] in ("4", "8") else f"{code}.SZ"))
-            r = http_get(EM_DATACENTER, params={
-                "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
-                "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,BOARD_NAME,BOARD_CODE,BOARD_TYPE,BOARD_RANK",
-                "filter": f'(SECUCODE="{secucode}")',
-                "pageNumber": 1, "pageSize": 200, "source": "WEB", "client": "WEB",
-            }, timeout=timeout, retries=retries, label=f"东财行业[{code}]", log=log)
-            rows = []
-            if r is not None:
-                rows = (((r.json() or {}).get("result") or {}).get("data")) or []
-            ranked: List[Tuple[int, str]] = []
-            for it in rows:
-                name = str(it.get("BOARD_NAME") or "").strip()
-                rank = safe_float(it.get("BOARD_RANK"))
-                if name:
-                    ranked.append((int(rank) if rank else 99, name))
-            if ranked:
-                ranked.sort(key=lambda x: x[0])
-                names = [n for _, n in ranked]
-                result["一级行业"] = names[0] if len(names) > 0 else ""
-                result["二级行业"] = names[1] if len(names) > 1 else result["一级行业"]
-                result["三级行业"] = names[2] if len(names) > 2 else result["二级行业"]
-                result["完整行业路径"] = "-".join([n for n in names[:3] if n])
+    if prefer == "eastmoney":
+        # 明确要求东财优先：东财 → 巨潮
+        if not _IND_FAIL_STREAK["skip_em"]:
+            try:
+                result = _industry_from_eastmoney(code, log, retries=retries, timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                _IND_FAIL_STREAK["n"] += 1
+                log(f"⚠️ 东财行业分类失败[{code}]: {type(e).__name__}: {str(e)[:80]}")
+            if result.get("一级行业"):
                 _IND_FAIL_STREAK["n"] = 0
             else:
                 _IND_FAIL_STREAK["n"] += 1
-        except Exception as e:  # noqa: BLE001
-            _IND_FAIL_STREAK["n"] += 1
-            log(f"⚠️ 东财行业分类失败[{code}]: {type(e).__name__}: {str(e)[:80]}")
-        if _IND_FAIL_STREAK["n"] >= _IND_FAIL_LIMIT and not _IND_FAIL_STREAK["skip_em"]:
-            _IND_FAIL_STREAK["skip_em"] = True
-            log(f"   ℹ️ 东财行业接口连续失败 {_IND_FAIL_STREAK['n']} 次，本轮改用巨潮行业分类"
-                f"（更快，每次约 0.3 秒；下次重启会自动重试东财）")
+            if _IND_FAIL_STREAK["n"] >= _IND_FAIL_LIMIT and not _IND_FAIL_STREAK["skip_em"]:
+                _IND_FAIL_STREAK["skip_em"] = True
+                log(f"   ℹ️ 东财行业接口连续失败 {_IND_FAIL_STREAK['n']} 次，本轮只用巨潮行业分类"
+                    f"（更快，每次约 0.4 秒；下次重启会自动重试东财）")
+        if not result.get("一级行业"):
+            result = _industry_from_cninfo(code)
+    elif prefer == "cninfo":
+        # 明确要求只用巨潮（最快，但同行分组偏粗：二级=行业大类）
+        result = _industry_from_cninfo(code)
+    else:
+        # 默认（混合）：先巨潮拿一份**稳定基线**（约 0.4s，几乎不失败），
+        # 再用东财细化 —— 因为**同行对比用的是「二级行业」**，而两个源粒度不同：
+        #     巨潮 二级 = 行业大类（食品制造业 / 酒、饮料和精制茶制造业）← 过宽
+        #     东财 二级 = 细分行业（饮料乳品）                          ← 真正的同行组
+        # 实测：600887/605499/603156/002946/600882 东财全部归为「饮料乳品」，
+        #       巨潮却分成两类 —— 用巨潮会把非同行公司并进同一组。
+        # 因此东财优先，但**超时压到 5 秒且不重试**（最坏 5s，而不是原来的 16~40s）；
+        # 东财一旦失败/熔断，直接用巨潮结果，流程不阻塞。
+        result = _industry_from_cninfo(code)
+        if not _IND_FAIL_STREAK["skip_em"]:
+            try:
+                em = _industry_from_eastmoney(code, log, retries=0, timeout=_EM_TIMEOUT)
+                if em.get("一级行业") and em.get("二级行业"):
+                    result = em                      # 用更细的东财结果
+                    _IND_FAIL_STREAK["n"] = 0
+                else:
+                    _IND_FAIL_STREAK["n"] += 1
+            except Exception as e:  # noqa: BLE001
+                _IND_FAIL_STREAK["n"] += 1
+                log(f"⚠️ 东财行业分类失败[{code}]（已用巨潮结果兜底）: {type(e).__name__}: {str(e)[:70]}")
+            if _IND_FAIL_STREAK["n"] >= _IND_FAIL_LIMIT and not _IND_FAIL_STREAK["skip_em"]:
+                _IND_FAIL_STREAK["skip_em"] = True
+                log(f"   ℹ️ 东财行业接口连续失败 {_IND_FAIL_STREAK['n']} 次，"
+                    f"本轮改用巨潮行业分类（更快，每次约 0.4 秒）"
+                    f"⚠️ 注意：巨潮的“二级行业”比东财粗，同行分组会偏宽；"
+                    f"如需精细分组可稍后重跑或设 VIM_INDUSTRY_SOURCE=eastmoney")
 
-    # ② 回退：巨潮行业分类（约 0.3s，稳定）
-    if not result["一级行业"]:
-        try:
-            import akshare as ak
-            df = ak.stock_industry_change_cninfo(symbol=code, start_date="20000101",
-                                                end_date=time.strftime("%Y%m%d"))
-            if df is not None and not df.empty:
-                row = df.iloc[-1]
-                for src, dst in (("行业门类", "一级行业"), ("行业次类", "二级行业"), ("行业中类", "三级行业")):
-                    val = str(row.get(src) or "").strip()
-                    if val:
-                        result[dst] = val
-                result["完整行业路径"] = "-".join(
-                    [result["一级行业"], result["二级行业"], result["三级行业"]]).strip("-")
-        except Exception as e:  # noqa: BLE001
-            log(f"⚠️ 巨潮行业分类失败[{code}]: {type(e).__name__}: {str(e)[:80]}")
-
-    if result["一级行业"] and not result["二级行业"]:
+    # 统一清理：pandas 读回的缺失值是 NaN，str(nan) == "nan"，
+    # 若不清理会一路写进《公司属性表》→ 16维度出现“行业: nan”。
+    result = {k: clean_str(v) for k, v in result.items()}
+    if result.get("一级行业") and not result.get("二级行业"):
         result["二级行业"] = result["一级行业"]
-    if result["一级行业"]:
+    if result.get("二级行业") and not result.get("完整行业路径"):
+        result["完整行业路径"] = result["二级行业"]
+    if result.get("一级行业"):
         cache.set(key, result)
     else:
-        # 记一笔短期负缓存（用极短 TTL 的独立键），避免本轮反复重试
+        # 记一笔短期负缓存，避免本轮反复重试
         cache.set(f"industry_fail_{code}", 1)
     return result
 

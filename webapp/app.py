@@ -119,14 +119,45 @@ st.markdown(
 )
 
 # ======================================================================
-# 会话级数据目录（云端文件系统不保证持久，故每次会话独立，并支持一键打包下载）
+# 数据目录
 # ======================================================================
+# 说明：早期版本用 tempfile.mkdtemp() 给每个会话建独立临时目录。问题是一旦
+# Streamlit 重跑脚本导致 session_state 重置（刷新页面、手机端切换/重连、
+# 点了“清空本次会话数据”后再刷新等），新会话会拿到**另一个**临时目录，
+# 之前跑出来的产物就“看不见”了 —— 用户反馈的“产物区为空”正是这个原因。
+#
+# 现在改用**固定目录**（容器内 / 或工作目录下的 vim_data）：
+#   - 重跑脚本、刷新页面、手机端重连后，产物仍然可见可下载；
+#   - 无法写入时才回退到临时目录（保证任何环境都能跑）。
+# 如需每个浏览器会话隔离，设置环境变量 VIM_DATA_DIR_PER_SESSION=1。
+def _data_root() -> str:
+    fixed = os.environ.get("VIM_DATA_DIR")
+    if fixed:
+        return fixed
+    for cand in ("/tmp/vim_data", os.path.join(os.getcwd(), "vim_data")):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, ".write_test")
+            with open(probe, "w") as fh:
+                fh.write("1")
+            os.remove(probe)
+            return cand
+        except Exception:  # noqa: BLE001
+            continue
+    return tempfile.mkdtemp(prefix="vim_")
+
+
 def _session_dir() -> str:
-    if "data_dir" not in st.session_state:
-        base = os.environ.get("VIM_DATA_DIR") or tempfile.mkdtemp(prefix="vim_")
-        st.session_state.data_dir = base
-        os.makedirs(base, exist_ok=True)
-    return st.session_state.data_dir
+    d = st.session_state.get("data_dir")
+    if d and os.path.isdir(d):
+        return d
+    if os.environ.get("VIM_DATA_DIR_PER_SESSION"):
+        d = tempfile.mkdtemp(prefix="vim_")
+    else:
+        d = _data_root()
+    os.makedirs(d, exist_ok=True)
+    st.session_state.data_dir = d
+    return d
 
 
 def _cache_dir() -> str:
@@ -427,17 +458,53 @@ def _stop_job() -> None:
 # ======================================================================
 # 结果与文件
 # ======================================================================
-def list_output_files() -> List[Dict[str, Any]]:
+def _orphan_roots(limit: int = 6) -> List[str]:
+    """找回旧版本遗留在临时目录里的产物。
+
+    早期版本把数据写到 ``/tmp/vim_xxxx``，会话重置后就“看不见”了。
+    这里按修改时间倒序找出这些目录，让用户仍能下载到已完成的结果。
+    """
+    found: List[str] = []
+    for base in ("/tmp", tempfile.gettempdir()):
+        try:
+            for name in os.listdir(base):
+                if not name.startswith("vim_"):
+                    continue
+                p = os.path.join(base, name)
+                if os.path.isdir(p) and p != _session_dir():
+                    found.append(p)
+        except Exception:  # noqa: BLE001
+            continue
+    found.sort(key=lambda d: -os.path.getmtime(d))
+    return found[:limit]
+
+
+def list_output_files(include_orphans: bool = True) -> List[Dict[str, Any]]:
     root = _session_dir()
     out: List[Dict[str, Any]] = []
     for r, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d != "_cache"]
         for f in files:
-            if f.startswith("~$"):
+            if f.startswith("~$") or f == ".write_test":
                 continue
             p = os.path.join(r, f)
             out.append({"name": f, "rel": os.path.relpath(p, root), "path": p,
                         "size": os.path.getsize(p), "mtime": os.path.getmtime(p)})
+    # 会话目录为空时，兜底扫描遗留的临时目录，避免“产物区为空”而其实文件还在
+    if not out and include_orphans:
+        for base in _orphan_roots():
+            for r, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if d != "_cache"]
+                for f in files:
+                    if f.startswith("~$") or f == ".write_test":
+                        continue
+                    p = os.path.join(r, f)
+                    out.append({"name": f, "rel": f"[历史会话] {os.path.basename(base)}/"
+                                                + os.path.relpath(p, base),
+                                "path": p, "size": os.path.getsize(p),
+                                "mtime": os.path.getmtime(p)})
+            if out:
+                break
     out.sort(key=lambda x: -x["mtime"])
     return out
 
@@ -530,8 +597,18 @@ def render_result_downloads(title: str, subdirs: List[str]) -> None:
 def render_files() -> None:
     files = list_output_files()
     st.subheader("📦 产物文件")
+    root = _session_dir()
+    st.caption(f"数据目录：`{root}`")
     if not files:
-        st.caption("还没有产物。先在上面的页面跑一个模块。")
+        st.info(
+            "当前数据目录里还没有产物。\n\n"
+            "**可能的原因**\n"
+            "1. 还没有跑过任何模块 —— 请到「🏠 总览」点一键运行；\n"
+            "2. 刚重启过应用（Streamlit Cloud 重启会清空磁盘）—— 需要重跑；\n"
+            "3. 会话被重置导致指向了新的数据目录。现已改为**固定数据目录**，"
+            "刷新页面或手机端重连后产物仍然可见。\n\n"
+            "跑完请**及时**在本页打包下载：云端磁盘重启即清空。"
+        )
         return
     st.caption(f"共 {len(files)} 个文件（云端文件不持久，请及时下载）")
     # 直接给出可保存的下载按钮（旧实现需要先点按钮再点“点此保存”，手机上一刷新就没了）
@@ -948,12 +1025,33 @@ with tabs[7]:
         ds["max_peers"] = st.number_input("同行取前 N 名", 1, 10, int(ds.get("max_peers", 3)))
         ds["request_timeout"] = st.number_input("请求超时(秒)", 5, 120, int(ds.get("request_timeout", 20)))
         ds["sleep_between"] = st.number_input("请求间隔(秒)", 0.0, 3.0, float(ds.get("sleep_between", 0.35)), 0.05)
+        _src_options = {
+            "混合（推荐）：巨潮打底 + 东财细分同行": "",
+            "只用巨潮：最快最稳，但同行分组偏粗": "cninfo",
+            "只用东财：同行最细，但常超时": "eastmoney",
+        }
+        _cur = ds.get("industry_source", "")
+        _keys = list(_src_options.keys())
+        _idx = list(_src_options.values()).index(_cur) if _cur in _src_options.values() else 0
+        _pick = st.selectbox("行业分类数据源（决定“同行”怎么分组）", _keys, index=_idx,
+                             key="ds_ind_src",
+                             help="同行对比用的是「二级行业」。东财的二级更细（如“饮料乳品”），"
+                                  "巨潮的二级是行业大类（如“食品制造业”，偏宽）。")
+        ds["industry_source"] = _src_options[_pick]
+        st.caption("实测（600887/605499/603156/002946/600882）：东财二级全部为「饮料乳品」；"
+                   "巨潮则分成「食品制造业」与「酒、饮料和精制茶制造业」两类。"
+                   "东财单次超时已压到 5 秒且不重试，连续失败 3 次自动熔断改用巨潮兜底。")
         st.info("本版本全部使用免费数据源：AkShare（新浪/东财/同花顺/巨潮）、腾讯行情、新浪行情。"
                 "Tushare 为可选（需 token）。")
         if st.button("保存数据源设置", use_container_width=True):
             cfg["data_source"] = ds
             cfg_mod.save_user_config(_session_dir(), cfg)
             st.session_state.user_config = cfg
+            # 环境变量优先于这里的选择，故同步设置一次，便于本次会话立即生效
+            if ds.get("industry_source"):
+                os.environ["VIM_INDUSTRY_SOURCE"] = ds["industry_source"]
+            else:
+                os.environ.pop("VIM_INDUSTRY_SOURCE", None)
             st.success("已保存")
 
 # ---------------- 产物 ----------------

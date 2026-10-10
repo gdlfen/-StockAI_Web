@@ -618,9 +618,15 @@ def extract_company_data(input_dir: str, params: Dict[str, Any],
                     for _, row in df_attr.iterrows():
                         code = str(row.get("目标股票", "")).strip()
                         if code:
-                            ind = str(row.get("二级行业", str(row.get("一级行业", "")))).replace("Ⅱ", "").replace(
-                                "Ⅰ", "")
-                            company_industry_map[code] = ind
+                            # clean_str：把 NaN 变成空串，避免 str(nan) == "nan" 被当成行业名
+                            try:
+                                from .universe import clean_str
+                            except Exception:  # noqa: BLE001
+                                clean_str = lambda x: "" if x is None else str(x).strip()  # noqa: E731
+                            ind = clean_str(row.get("二级行业")) or clean_str(row.get("一级行业"))
+                            ind = ind.replace("Ⅱ", "").replace("Ⅰ", "")
+                            if ind:
+                                company_industry_map[code] = ind
                 except Exception as e:  # noqa: BLE001  桌面版为静默 except: pass
                     log_fn(f"  ⚠️ 公司属性表读取失败，已跳过: {filename} ({type(e).__name__}: {str(e)[:100]})")
 

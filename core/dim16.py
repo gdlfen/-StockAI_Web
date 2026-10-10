@@ -871,10 +871,15 @@ def scan_companies(input_dir: str,
                     for _, row in df_attr.iterrows():
                         c_code = str(row.get("目标股票", "")).strip()
                         if c_code:
-                            c_ind = str(row.get("二级行业", str(row.get("一级行业", "")))).replace("Ⅱ",
-                                                                                                   "").replace(
-                                "Ⅰ", "").strip()
-                            if c_ind: company_industry_map[c_code] = c_ind
+                            # clean_str：NaN → 空串，否则行业会变成字符串 "nan"（报告名出现 _nan_）
+                            try:
+                                from .universe import clean_str
+                            except Exception:  # noqa: BLE001
+                                clean_str = lambda x: "" if x is None else str(x).strip()  # noqa: E731
+                            c_ind = clean_str(row.get("二级行业")) or clean_str(row.get("一级行业"))
+                            c_ind = c_ind.replace("Ⅱ", "").replace("Ⅰ", "").strip()
+                            if c_ind:
+                                company_industry_map[c_code] = c_ind
                 except Exception as e:  # noqa: BLE001
                     _log(f"  ⚠️ 公司属性表读取失败，已跳过: {f} ({type(e).__name__}: {str(e)[:120]})")
 

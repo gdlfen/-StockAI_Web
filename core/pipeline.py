@@ -353,5 +353,15 @@ def make_context(data_dir: str, cache_dir: str, user_config: Optional[Dict[str, 
                  log: Optional[Callable[[str], None]] = None,
                  progress: Optional[Callable[[int, int, str], None]] = None) -> PipelineContext:
     cfg = user_config or cfg_mod.load_user_config(data_dir)
+    # 「设置 → 数据源 → 行业分类数据源」的持久设置，同步到环境变量供 core.universe 读取。
+    # （环境变量优先级最高，所以这里只在用户明确选过时写入。）
+    try:
+        _src = str((cfg.get("data_source") or {}).get("industry_source") or "").strip().lower()
+        if _src in ("cninfo", "eastmoney"):
+            os.environ["VIM_INDUSTRY_SOURCE"] = _src
+        elif _src == "":
+            os.environ.pop("VIM_INDUSTRY_SOURCE", None)
+    except Exception:  # noqa: BLE001
+        pass
     return PipelineContext(data_dir=data_dir, cache_dir=cache_dir, config=cfg,
                            log=log or make_logger(), progress=progress)
