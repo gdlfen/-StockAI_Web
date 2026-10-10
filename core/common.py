@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+from collections import OrderedDict
 import re
 import time
 from datetime import datetime, timedelta
@@ -104,12 +105,21 @@ def http_post(url: str, *, data: Optional[dict] = None, headers: Optional[dict] 
 # 磁盘缓存（JSON，带 TTL）
 # ======================================================================
 class DiskCache:
-    """简单可靠的磁盘缓存。云端重启后失效也没关系，只是慢一点。"""
+    """简单可靠的磁盘缓存。云端重启后失效也没关系，只是慢一点。
+
+    进程内再加一层内存缓存（``_mem``）：热点键（如 ``listed_600519``、``industry_*``）
+    在一次运行里会被反复读取，每次读盘要 3 次系统调用，实测单次约 130ms（Windows 上更明显）。
+    内存层用 (mtime, 值) 做校验，磁盘文件被改写或过期会自动失效，不会读到脏数据。
+    """
+
+    _MEM_LIMIT = 8192
 
     def __init__(self, cache_dir: str, ttl_hours: float = 12.0):
         self.cache_dir = cache_dir
         self.ttl = timedelta(hours=ttl_hours)
         os.makedirs(self.cache_dir, exist_ok=True)
+        # key -> (路径, mtime, 值)；有界，避免长时间运行占内存
+        self._mem: "OrderedDict[str, tuple]" = OrderedDict()
 
     def _path(self, key: str) -> str:
         safe = hashlib.md5(key.encode("utf-8")).hexdigest()
@@ -119,18 +129,46 @@ class DiskCache:
         path = self._path(key)
         try:
             if not os.path.exists(path):
+                self._mem.pop(key, None)
                 return None
-            if datetime.now() - datetime.fromtimestamp(os.path.getmtime(path)) > self.ttl:
+            mtime = os.path.getmtime(path)
+            if datetime.now() - datetime.fromtimestamp(mtime) > self.ttl:
+                self._mem.pop(key, None)
                 return None
+            hit = self._mem.get(key)
+            if hit is not None and hit[0] == path and hit[1] == mtime:
+                self._mem.move_to_end(key)
+                return hit[2]
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                value = json.load(f)
+            self._mem[key] = (path, mtime, value)
+            self._mem.move_to_end(key)
+            while len(self._mem) > self._MEM_LIMIT:
+                self._mem.popitem(last=False)
+            return value
         except Exception:
             return None
 
-    def set(self, key: str, value: Any) -> None:
+    def delete(self, key: str) -> None:
+        """删除某个键（内存 + 磁盘）。"""
+        self._mem.pop(key, None)
         try:
-            with open(self._path(key), "w", encoding="utf-8") as f:
+            os.remove(self._path(key))
+        except Exception:
+            pass
+
+    def set(self, key: str, value: Any) -> None:
+        path = self._path(key)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(value, f, ensure_ascii=False)
+            try:
+                self._mem[key] = (path, os.path.getmtime(path), value)
+                self._mem.move_to_end(key)
+                while len(self._mem) > self._MEM_LIMIT:
+                    self._mem.popitem(last=False)
+            except Exception:
+                pass
         except Exception:
             pass
 

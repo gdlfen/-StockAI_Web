@@ -148,6 +148,66 @@ class StockUniverse:
 _IND_FAIL_STREAK = {"n": 0, "skip_em": False}
 _IND_FAIL_LIMIT = 3
 
+# ----------------------------------------------------------------------
+# 东财健康度熔断
+# ----------------------------------------------------------------------
+# 问题：原来的「连续失败 3 次」熔断在**东财整体不可用**时几乎不触发 —— 只要偶尔成功一次
+# 计数就清零，于是每只股票都白等 5 秒（实测用户环境 1200 只候选 → 约 100 分钟）。
+# 改为**失败率熔断**：最近 N 次尝试里失败占比超过阈值，就本轮彻底停用东财。
+_EM_HEALTH = {"total": 0, "fail": 0, "window": [], "checked_in": 0}
+_EM_WINDOW = 12          # 观察窗口（最近多少次尝试）
+_EM_FAIL_RATE = 0.5      # 窗口内失败率 ≥ 该值即熔断
+_EM_MIN_SAMPLES = 4      # 至少尝试这么多次才判定（避免开局误杀）
+
+
+def em_healthy() -> bool:
+    """东财是否仍值得尝试（失败率熔断，进程内生效）。"""
+    return not _IND_FAIL_STREAK["skip_em"]
+
+
+def _em_record(ok: bool, log=None) -> None:
+    """记录一次东财尝试结果，并按失败率决定是否熔断。"""
+    _EM_HEALTH["total"] += 1
+    if not ok:
+        _EM_HEALTH["fail"] += 1
+    _EM_HEALTH["window"].append(bool(ok))
+    if len(_EM_HEALTH["window"]) > _EM_WINDOW:
+        _EM_HEALTH["window"].pop(0)
+
+    if _IND_FAIL_STREAK["skip_em"]:
+        return
+    wins = _EM_HEALTH["window"]
+    if len(wins) < _EM_MIN_SAMPLES:
+        return
+    rate = 1.0 - (sum(1 for x in wins if x) / len(wins))
+    if rate >= _EM_FAIL_RATE:
+        _IND_FAIL_STREAK["skip_em"] = True
+        if log is not None:
+            log(f"   ⛔ 东财行业接口最近 {len(wins)} 次尝试失败率 {rate:.0%}"
+                f"（累计 {_EM_HEALTH['fail']}/{_EM_HEALTH['total']}），"
+                f"本轮停用东财、改用巨潮行业分类（约 0.4 秒/只，稳定）")
+            log("   ℹ️ 影响：巨潮的“二级行业”比东财粗（如“食品制造业”而非“饮料乳品”），"
+                "同行分组会偏宽。可在「设置 → 数据源」选“只用巨潮”以跳过这段探测；"
+                "网络恢复后可重跑以自动重新启用东财。")
+
+
+def industry_health() -> Dict[str, Any]:
+    """供界面展示的东财健康度。"""
+    wins = _EM_HEALTH["window"]
+    return {
+        "东财已熔断": bool(_IND_FAIL_STREAK["skip_em"]),
+        "东财尝试次数": _EM_HEALTH["total"],
+        "东财失败次数": _EM_HEALTH["fail"],
+        "最近窗口失败率": (round(1.0 - sum(1 for x in wins if x) / len(wins), 3) if wins else None),
+    }
+
+
+def reset_industry_health() -> None:
+    """重跑前重置熔断状态（界面「重试东财」用）。"""
+    _IND_FAIL_STREAK.update({"n": 0, "skip_em": False})
+    _EM_HEALTH.update({"total": 0, "fail": 0, "window": [], "checked_in": 0})
+
+
 # 东财行业接口的单次超时：原来 8s×2 次（最坏 ~16s），实测该接口在云环境经常整体超时，
 # 故压到 5s 且不重试。可用环境变量 VIM_EM_INDUSTRY_TIMEOUT 调整。
 def _em_timeout() -> int:
@@ -270,7 +330,7 @@ def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None
 
     if prefer == "eastmoney":
         # 明确要求东财优先：东财 → 巨潮
-        if not _IND_FAIL_STREAK["skip_em"]:
+        if em_healthy():
             try:
                 result = _industry_from_eastmoney(code, log, retries=retries, timeout=timeout)
             except Exception as e:  # noqa: BLE001
@@ -278,12 +338,10 @@ def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None
                 log(f"⚠️ 东财行业分类失败[{code}]: {type(e).__name__}: {str(e)[:80]}")
             if result.get("一级行业"):
                 _IND_FAIL_STREAK["n"] = 0
+                _em_record(True, log)
             else:
                 _IND_FAIL_STREAK["n"] += 1
-            if _IND_FAIL_STREAK["n"] >= _IND_FAIL_LIMIT and not _IND_FAIL_STREAK["skip_em"]:
-                _IND_FAIL_STREAK["skip_em"] = True
-                log(f"   ℹ️ 东财行业接口连续失败 {_IND_FAIL_STREAK['n']} 次，本轮只用巨潮行业分类"
-                    f"（更快，每次约 0.4 秒；下次重启会自动重试东财）")
+                _em_record(False, log)
         if not result.get("一级行业"):
             result = _industry_from_cninfo(code)
     elif prefer == "cninfo":
@@ -299,23 +357,20 @@ def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None
         # 因此东财优先，但**超时压到 5 秒且不重试**（最坏 5s，而不是原来的 16~40s）；
         # 东财一旦失败/熔断，直接用巨潮结果，流程不阻塞。
         result = _industry_from_cninfo(code)
-        if not _IND_FAIL_STREAK["skip_em"]:
+        if em_healthy():
             try:
                 em = _industry_from_eastmoney(code, log, retries=0, timeout=_EM_TIMEOUT)
                 if em.get("一级行业") and em.get("二级行业"):
                     result = em                      # 用更细的东财结果
                     _IND_FAIL_STREAK["n"] = 0
+                    _em_record(True, log)
                 else:
                     _IND_FAIL_STREAK["n"] += 1
+                    _em_record(False, log)
             except Exception as e:  # noqa: BLE001
                 _IND_FAIL_STREAK["n"] += 1
+                _em_record(False, log)
                 log(f"⚠️ 东财行业分类失败[{code}]（已用巨潮结果兜底）: {type(e).__name__}: {str(e)[:70]}")
-            if _IND_FAIL_STREAK["n"] >= _IND_FAIL_LIMIT and not _IND_FAIL_STREAK["skip_em"]:
-                _IND_FAIL_STREAK["skip_em"] = True
-                log(f"   ℹ️ 东财行业接口连续失败 {_IND_FAIL_STREAK['n']} 次，"
-                    f"本轮改用巨潮行业分类（更快，每次约 0.4 秒）"
-                    f"⚠️ 注意：巨潮的“二级行业”比东财粗，同行分组会偏宽；"
-                    f"如需精细分组可稍后重跑或设 VIM_INDUSTRY_SOURCE=eastmoney")
 
     # 统一清理：pandas 读回的缺失值是 NaN，str(nan) == "nan"，
     # 若不清理会一路写进《公司属性表》→ 16维度出现“行业: nan”。

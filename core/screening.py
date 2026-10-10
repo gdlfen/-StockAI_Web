@@ -431,17 +431,33 @@ def build_candidate_pool(cond: Dict[str, Any], universe: StockUniverse, cache: D
     min_years = float(cond["min_listed_years"]) if need_listed else 0.0
 
     # ① 先做“不需要网络”的过滤：市值门槛 + 非金融
+    # 【性能关键】「剔除金融股」原来每只都要请求行业接口（候选池 1200 只 × 0.4~5 秒
+    #  = 几十秒到 100 分钟）。现在先用本地代码表判定（零请求），
+    #  只有本地判不出来的才落到行业接口兜底。
+    from .fin_classify import is_financial
     pre: List[Tuple[str, str, float]] = []
+    _fin_local = _fin_unknown = 0
     for code, name, cap in enriched:
         if cond.get("min_market_cap") is not None and cap < float(cond["min_market_cap"]):
             continue
         if cond.get("exclude_finance"):
-            ind = industry_label(get_industry(code, cache, log=None))
-            if any(k in ind for k in _FINANCE_KEYS):
+            fin = is_financial(code, name)
+            if fin is True:
+                _fin_local += 1
                 continue
+            if fin is None:
+                # 本地判不出来：才去查行业（极少数）
+                _fin_unknown += 1
+                ind = industry_label(get_industry(code, cache, log=None))
+                if any(k in ind for k in _FINANCE_KEYS):
+                    _fin_local += 1
+                    continue
         pre.append((code, name, cap))
         if len(pre) >= pool_size * 6:
             break
+    if cond.get("exclude_finance"):
+        log(f"   剔除金融股 {_fin_local} 只（本地代码表判定，零网络请求；"
+            f"其中 {_fin_unknown} 只走了行业接口兜底）")
 
     if need_listed:
         log(f"   正在逐只获取精确上市日期（门槛：上市 > {min_years:g} 年，串行+缓存）…")
