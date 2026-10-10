@@ -1146,12 +1146,25 @@ def run_all(input_dir: str, output_dir: str, cfg: Dict[str, Any],
         all_data = scan_companies(input_dir, log=log)
         if not all_data:
             _log("⚠️ 未提取到有效数据，已跳过。")
-            return {"ok": False, "files": files, "industries": industries, "error": "未提取到有效数据"}
+            return {"ok": False, "files": files, "industries": industries,
+                    "error": "未提取到有效数据（《报表提取完善》下没有可用的《统一整合输出》文件；"
+                             "请先跑“年报数据搜索汇总”）"}
 
         rep_map = _scan_industry_rep_map(input_dir)
         merged_cfg = _merge_cfg(cfg)
         total = len(all_data)
         generated_count = 0
+
+        # 明确提示“同行公司不足”：16 维度是**同行对比**，每个行业至少要有 2 家公司，
+        # 否则逐维度对比没有对手，结果为空。旧版本只打印“未提取到有效数据”，
+        # 用户无法判断是自己只跑了 1 家公司还是数据有问题。
+        thin = {ind: len(cd) for ind, cd in all_data.items() if len(cd) < 2}
+        if thin:
+            need_total = sum(1 for cd in all_data.values() if len(cd) < 2)
+            _log(f"   ⚠️ 有 {need_total} 个行业的同行公司不足 2 家，无法做同行对比："
+                 + "、".join(f"{k}({v}家)" for k, v in list(thin.items())[:8]))
+            _log("   ℹ️ 16 维度需要**同一行业内至少 2 家公司**。请在“年报数据”页多指定几家"
+                 "同行业公司（例如乳品：伊利股份 600887、东鹏饮料 605499、养元饮品 603156）。")
 
         for idx, (industry, comp_dict) in enumerate(all_data.items(), start=1):
             if progress is not None:

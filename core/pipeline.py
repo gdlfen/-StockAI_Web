@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -93,12 +94,44 @@ def stage_report(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]
         summary = os.path.join(ctx.data_dir, C.DIR_HAIXUAN, C.HAIXUAN_SUMMARY)
         if os.path.exists(summary):
             import pandas as pd
-            df = pd.read_excel(summary)
+            # dtype=str：否则 pandas 会把纯数字的“代码”列读成 float（600887 → 600887.0）
+            df = pd.read_excel(summary, dtype=str)
             targets = [{"code": str(r.get("代码", "")).zfill(6), "name": str(r.get("名称", "")),
                         "属性": C.TARGET_ATTR_PRIMARY} for _, r in df.iterrows()]
             ctx.log(f"   已从《{C.HAIXUAN_SUMMARY}》读取 {len(targets)} 家目标公司")
     if not targets:
         raise RuntimeError("没有目标公司：请先跑“海选公司”，或手工指定公司列表。")
+
+    # 【代码 → 名称】补全：用户只填代码时（如“600887”），原逻辑会把代码当名称用，
+    # 于是出现 “600887（600887）/ 600887_600887_深度排雷报告” 这类结果，
+    # 下游的行业/同行/估值文件名也跟着错。这里统一用全市场清单补出真实简称。
+    code2name: Dict[str, str] = {}
+    try:
+        from .universe import StockUniverse
+        u = StockUniverse(ctx.cache)
+        _udf = u.load()
+        if _udf is not None and not _udf.empty and "code" in _udf.columns:
+            code2name = {str(c).zfill(6): str(n).strip()
+                         for c, n in zip(_udf["code"], _udf["name"])}
+    except Exception as e:  # noqa: BLE001
+        ctx.log(f"   ⚠️ 代码→名称 映射表获取失败（不影响提取，仅影响文件名显示）：{type(e).__name__}")
+
+    fixed: List[Dict[str, Any]] = []
+    filled = 0
+    for t in targets:
+        code = str(t.get("code") or "").strip()
+        m = re.search(r"\d{6}", code)
+        code = m.group(0) if m else code.zfill(6)
+        name = str(t.get("name") or "").strip()
+        # 名称为空、或名称本身就是那串代码 → 用清单里的简称替换
+        if code in code2name and (not name or name == code or name.lstrip("0") == code.lstrip("0")
+                                  or name in (code + ".0",) or not re.search(r"\D", name)):
+            name = code2name[code]
+            filled += 1
+        fixed.append({**t, "code": code, "name": name or code})
+    targets = fixed
+    if filled:
+        ctx.log(f"   ✅ 已为 {filled} 家公司补全名称（例如 {targets[0]['code']} → {targets[0]['name']}）")
 
     start_y = params.get("start_year")
     end_y = params.get("end_year")
@@ -118,14 +151,32 @@ def stage_report(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]
 
 def stage_fraud(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]:
     from . import fraud
+    from . import employee_data as emp_mod
     _log_stage(ctx, "3. 造假排雷（18 项）")
     in_dir = os.path.join(ctx.data_dir, C.DIR_EXTRACT)
     if not os.path.isdir(in_dir):
         raise RuntimeError(f"未找到《报表提取完善》目录：{in_dir}，请先跑“年报数据搜索汇总”。")
     p = dict(ctx.config.get("fraud_params") or cfg_mod.default_fraud_params())
     p.update(params.get("fraud_params") or {})
-    res = fraud.run_all(in_dir, ctx.data_dir, p, log=ctx.log, progress=ctx.progress)
+
+    # 【员工人数补充】C1/C2 依赖员工人数，而免费数据源不提供。
+    # 用户上传/随仓库放置的补充数据在这里注入，注入后 C1/C2 与桌面版口径一致。
+    supplement, src = emp_mod.load_supplement(ctx.data_dir, _project_root())
+    if supplement:
+        ctx.log(f"   ℹ️ 已载入员工人数补充数据（{src}）")
+    else:
+        ctx.log("   ℹ️ 未提供员工人数补充数据：C1/C2 将标注“数据不足”"
+                "（可在「造假排雷」页上传《员工人数补充.csv》恢复与桌面版一致的判定）")
+
+    res = fraud.run_all(in_dir, ctx.data_dir, p, log=ctx.log, progress=ctx.progress,
+                        employee_supplement=supplement)
     return _jsonable(res)
+
+
+def _project_root() -> str:
+    """项目根（含 core/ 的目录），用于查找随仓库上传的补充文件。"""
+    here = os.path.dirname(os.path.abspath(__file__))      # .../core
+    return os.path.dirname(here)
 
 
 def stage_dim16(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -168,16 +219,62 @@ def stage_valuation(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, A
         import pandas as pd
         list_path = os.path.join(ctx.data_dir, C.TARGET_LIST_FILENAME)
         if os.path.exists(list_path):
-            df = pd.read_excel(list_path)
+            # dtype=str：否则“代码”列被读成 float，str() 后变成 "600887.0"，
+            # 后续报价接口与文件名都会带上 .0（日志里出现 600887.0 即此原因）
+            df = pd.read_excel(list_path, dtype=str)
             tks = []
             for _, r in df.iterrows():
-                code = str(r.get("代码", "")).zfill(6)
-                name = str(r.get("名称", ""))
+                raw = str(r.get("代码", "")).strip()
+                m = re.search(r"\d{1,6}", raw)
+                code = m.group(0).zfill(6) if m else ""
+                name = str(r.get("名称", "")).strip()
                 if code and code != "000000":
                     tks.append({"code": code, "name": name})
             if tks:
                 cfg["targets"] = tks
                 ctx.log(f"   已从《{C.TARGET_LIST_FILENAME}》读取 {len(tks)} 只估值标的")
+
+    # 若无显式标的、也没有年报名单 → 才使用内置默认标的（平安银行/贵州茅台/腾讯控股…）。
+    # 有明确名单时**不再混入默认标的**，否则用户明明只传了 600887，结果却出现 7 条记录。
+    using_defaults = False
+    if not cfg.get("targets"):
+        using_defaults = True
+        ctx.log("   ℹ️ 未指定估值标的，使用内置默认标的（可在「好价估值」页手工填写覆盖）")
+
+    # 名称补全：用户只填代码（或填了简称但配不上代码）时，统一用全市场清单补齐简称，
+    # 否则表格里会出现只有数字、或“无法识别标的：微软”这类情况。
+    try:
+        from .universe import StockUniverse
+        _u = StockUniverse(ctx.cache)
+        _udf = _u.load()
+        if _udf is not None and not _udf.empty and "code" in _udf.columns:
+            _c2n = {str(c).zfill(6): str(n).strip() for c, n in zip(_udf["code"], _udf["name"])}
+            _n2c = {str(n).strip(): str(c).zfill(6) for c, n in zip(_udf["code"], _udf["name"])}
+            _fixed = []
+            for t in (cfg.get("targets") or []):
+                code = str(t.get("code") or "").strip()
+                name = str(t.get("name") or "").strip()
+                m = re.search(r"\d{6}", code)
+                code = m.group(0) if m else code
+                if not code and name in _n2c:          # 只填了中文简称
+                    code = _n2c[name]
+                if code and (not name or name == code or not re.search(r"\D", name)):
+                    name = _c2n.get(code, name)
+                # 估值表格里显示“简称(代码)”更易读（原来只显示 600887）
+                if code and name and name != code:
+                    _fixed.append({**t, "code": code, "name": name,
+                                   "display": f"{name}({code})"})
+                else:
+                    _fixed.append({**t, "code": code, "name": name})
+            cfg["targets"] = _fixed
+    except Exception as e:  # noqa: BLE001
+        ctx.log(f"   ⚠️ 估值标的名称补全失败（不影响取值）：{type(e).__name__}")
+
+    # 港股/美股默认标的：只在“使用默认标的”时才带上，避免污染用户指定名单
+    if not using_defaults:
+        for k in ("a_stocks", "hk_stocks", "us_stocks"):
+            cfg.pop(k, None)
+
     cfg["_cache"] = ctx.cache
     out_dir = os.path.join(ctx.data_dir, C.DIR_VALUATION)
     res = valuation.run_valuation(cfg, out_dir, log=ctx.log, progress=ctx.progress)

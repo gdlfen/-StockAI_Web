@@ -465,11 +465,23 @@ def run_valuation(cfg: Dict[str, Any], output_dir: str,
     a_list = _as_list(merged.get("a_stocks"))
     hk_list = _as_list(merged.get("hk_stocks"))
     us_list = _as_list(merged.get("us_stocks"))
-    # 支持直接传入目标公司（来自年报汇总）：优先用代码，避免“名称/代码”混排
+
+    # 支持直接传入目标公司（来自年报汇总 / 手工填写）：优先用代码，避免“名称/代码”混排
+    _explicit_targets = bool(merged.get("targets"))
+    _keep_defaults = bool(merged.get("include_default_targets"))
+    if _explicit_targets and not _keep_defaults:
+        # 【替换而非追加】只要给了明确标的，就**丢弃** VALUATION_DEFAULTS 里的
+        # a_stocks/hk_stocks/us_stocks（平安银行/贵州茅台/腾讯控股/MSFT/AAPL…）。
+        # 否则用户只传了 600887，结果表里却出现 7 条记录 —— 这正是用户反馈的现象。
+        a_list, hk_list, us_list = [], [], []
+        log("   ℹ️ 已使用指定标的，不再附加内置默认标的（如需一并比较，请把默认标的也写进标的清单）")
+
     for t in (merged.get("targets") or []):
         code = str(t.get("code") or "").strip()
         nm = str(t.get("name") or "").strip()
-        key = code if re.fullmatch(r"\d{6}", code) else nm
+        disp = str(t.get("display") or "").strip()
+        # 优先用“简称(代码)”作为表格显示值，其次代码，再其次名称
+        key = disp or (code if re.fullmatch(r"\d{6}", code) else nm)
         if key and key not in a_list:
             a_list.append(key)
 

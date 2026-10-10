@@ -63,6 +63,8 @@ try:
     from core.common import DiskCache, make_logger  # noqa: E402
     # 海选条件设置面板需要把“文字模板”解析成结构化条件
     from core.screening import parse_query as screening_parse_query  # noqa: E402
+    # 员工人数补充（排雷 C1/C2 需要；免费数据源不提供，故支持手工补充）
+    from core import employee_data as emp_mod                       # noqa: E402
 except ModuleNotFoundError as _imp_err:         # noqa: F841
     st.set_page_config(page_title="启动失败", page_icon="⚠️", layout="centered")
     st.error("### 未找到项目代码目录 `core/`，无法启动")
@@ -453,6 +455,78 @@ def zip_all(root: str) -> bytes:
     return buf.getvalue()
 
 
+def zip_paths(paths: List[str]) -> bytes:
+    """把给定文件列表打包成 zip（用于模块页的“打包下载本模块结果”）。
+
+    压缩包内保留相对“本次会话目录”的路径，解压后目录结构与产物页一致。
+    """
+    root = _session_dir()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in paths:
+            if not os.path.isfile(p):
+                continue
+            try:
+                arc = os.path.relpath(p, root)
+            except ValueError:      # 跨盘符等异常情况
+                arc = os.path.basename(p)
+            z.write(p, arc)
+    return buf.getvalue()
+
+
+def module_files(subdir: str) -> List[Dict[str, Any]]:
+    """取某个模块目录下的产物文件（用于在模块页直接下载）。"""
+    root = _session_dir()
+    base = os.path.join(root, subdir)
+    out: List[Dict[str, Any]] = []
+    if not os.path.isdir(base):
+        return out
+    for r, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d != "_cache"]
+        for f in files:
+            if f.startswith("~$"):
+                continue
+            p = os.path.join(r, f)
+            out.append({"name": f, "rel": os.path.relpath(p, root), "path": p,
+                        "size": os.path.getsize(p), "mtime": os.path.getmtime(p)})
+    out.sort(key=lambda x: x["rel"])
+    return out
+
+
+def render_result_downloads(title: str, subdirs: List[str]) -> None:
+    """在模块页直接给出“下载本模块结果”的按钮 —— 不必再去「📦 产物」页翻。
+
+    subdirs 里任意一个目录不存在就静默跳过，因此可以安全地在每个模块页调用。
+    """
+    files: List[Dict[str, Any]] = []
+    for sd in subdirs:
+        files.extend(module_files(sd))
+    if not files:
+        return
+    files.sort(key=lambda x: x["rel"])
+    total_kb = sum(f["size"] for f in files) / 1024
+    with st.expander(f"📥 {title}：共 {len(files)} 个文件（{total_kb:.0f} KB）—— 点此展开下载",
+                     expanded=True):
+        st.caption("云端磁盘重启后会清空，请及时下载保存。")
+        # ① 一键打包（直接就是可保存的下载按钮，不需要点两次）
+        if len(files) > 1:
+            st.download_button(f"⬇️ 打包下载这 {len(files)} 个文件（zip）",
+                               data=zip_paths([f["path"] for f in files]),
+                               file_name=f"{title}_{datetime.now():%Y%m%d_%H%M}.zip",
+                               mime="application/zip", use_container_width=True,
+                               type="primary", key=f"zipmod_{title}")
+        # ② 逐个下载
+        for f in files:
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.markdown(f"**{f['name']}**  \n<span style='color:#888;font-size:0.8em'>"
+                            f"{f['size']/1024:.0f} KB</span>", unsafe_allow_html=True)
+            with c2:
+                with open(f["path"], "rb") as fh:
+                    st.download_button("下载", data=fh.read(), file_name=f["name"],
+                                       key=f"dlmod_{f['rel']}", use_container_width=True)
+
+
 def render_files() -> None:
     files = list_output_files()
     st.subheader("📦 产物文件")
@@ -460,12 +534,12 @@ def render_files() -> None:
         st.caption("还没有产物。先在上面的页面跑一个模块。")
         return
     st.caption(f"共 {len(files)} 个文件（云端文件不持久，请及时下载）")
-    if st.button("⬇️ 打包下载全部产物（zip）", use_container_width=True, type="primary"):
-        st.download_button("点此保存 zip",
-                           data=zip_all(_session_dir()),
-                           file_name=f"价值投资分析产物_{datetime.now():%Y%m%d_%H%M}.zip",
-                           mime="application/zip", use_container_width=True)
-    for f in files[:120]:
+    # 直接给出可保存的下载按钮（旧实现需要先点按钮再点“点此保存”，手机上一刷新就没了）
+    st.download_button(f"⬇️ 打包下载全部产物（zip，共 {len(files)} 个文件）",
+                       data=zip_all(_session_dir()),
+                       file_name=f"价值投资分析产物_{datetime.now():%Y%m%d_%H%M}.zip",
+                       mime="application/zip", use_container_width=True, type="primary")
+    for f in files[:150]:
         col1, col2 = st.columns([3, 1])
         with col1:
             st.markdown(f"**{f['name']}**  \n<span style='color:#888;font-size:0.8em'>"
@@ -628,10 +702,10 @@ with tabs[1]:
             st.download_button("下载《海选公司汇总表》CSV",
                                df.to_csv(index=False).encode("utf-8-sig"),
                                file_name="海选公司汇总表.csv", mime="text/csv")
-        detail = res.get("detail") or []
         if detail:
             with st.expander(f"查看全部候选明细（{len(detail)} 家，含未通过原因）", expanded=not stocks):
                 st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
+        render_result_downloads("海选结果", [C.DIR_HAIXUAN])
 
 # ---------------- 年报数据 ----------------
 with tabs[2]:
@@ -659,6 +733,7 @@ with tabs[2]:
     if snap and snap.get("result"):
         res = (snap["result"].get("results") or {}).get("report") or {}
         st.success(f"生成 {len(res.get('files') or [])} 个文件")
+        render_result_downloads("年报数据结果", [C.DIR_EXTRACT])
         comps = res.get("companies") or []
         if comps:
             st.dataframe(pd.DataFrame(comps), use_container_width=True, hide_index=True)
@@ -668,6 +743,60 @@ with tabs[3]:
     st.markdown("#### 🕵️ 财务造假排雷（18 项）")
     st.caption("读取《统一整合输出》逐公司逐年度跑 18 条判断，产出《深度排雷报告.xlsx》。")
     cfg = _cfg()
+
+    # ============ 员工人数补充 ============
+    # C1/C2 依赖员工人数，免费数据源不提供 → 用户可在此补充，补充后按桌面版口径判定。
+    with st.expander("👥 员工人数补充（可选）—— 补齐后 C1/C2 按桌面版口径判定",
+                     expanded=False):
+        _src_data, _src_note = emp_mod.load_supplement(_session_dir(), _PROJECT_ROOT)
+        if _src_data:
+            _n = sum(len(v) for v in _src_data.values())
+            st.success(f"已载入 {len(_src_data)} 家公司 / {_n} 条年度员工人数。来源：{_src_note}")
+        else:
+            st.info("**为什么需要补充？** 排雷的 C1「员工与营收背离」、C2「人均薪酬异常」"
+                    "要用历年**员工人数**。桌面版从年报 PDF 的“员工情况”章节取；"
+                    "免费数据源（AkShare/TuShare/巨潮/东财）**没有**这个字段，"
+                    "所以这两条目前显示“数据不足”（而不是按 0 算成误导性的预警）。\n\n"
+                    "**两种补充方式**：① 在下方上传文件（本次会话有效）；"
+                    "② 把文件命名为 `员工人数补充.csv` 放到**项目根目录**随仓库上传（跨重启持久有效）。")
+
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            st.download_button("⬇️ 下载填写模板（含示例）", data=emp_mod.template_bytes(),
+                               file_name="员工人数补充_模板.csv", mime="text/csv",
+                               use_container_width=True, key="emp_tpl")
+        with _c2:
+            if _src_data:
+                st.download_button("⬇️ 导出当前生效数据", data=emp_mod.to_csv_bytes(_src_data),
+                                   file_name="员工人数补充.csv", mime="text/csv",
+                                   use_container_width=True, key="emp_exp")
+
+        _up = st.file_uploader("上传《员工人数补充》表格（.csv / .xlsx）",
+                               type=["csv", "xlsx", "xls"], key="emp_up",
+                               help="支持两种格式：长表（代码|年份|员工人数）或宽表（代码|2021|2022|…）")
+        if _up is not None:
+            try:
+                _d, _notes = emp_mod.parse_employee_bytes(_up.getvalue(), _up.name)
+                if _d:
+                    _p = emp_mod.save_supplement(_session_dir(), _d)
+                    _tot = sum(len(v) for v in _d.values())
+                    st.success(f"✅ 已解析 {len(_d)} 家公司 / {_tot} 条年度员工人数，"
+                               f"已保存为 {os.path.basename(_p)}（本次会话生效）")
+                    with st.expander("查看解析结果", expanded=False):
+                        st.json({k: dict(sorted(v.items())) for k, v in sorted(_d.items())})
+                    if _notes:
+                        st.warning("以下内容未识别：\n- " + "\n- ".join(_notes[:12]))
+                else:
+                    st.error("未解析出任何员工人数。请确认表格含「代码」「年份」「员工人数」"
+                             "三列（或宽表：首列代码、其余列名是年份）。")
+                    if _notes:
+                        st.warning("\n- ".join(_notes[:12]))
+            except Exception as _e:  # noqa: BLE001
+                st.error(f"解析失败：{type(_e).__name__}: {_e}")
+
+        st.caption("🔎 提示：员工人数可从各公司年报“第四节 公司治理/员工情况”或"
+                   "“合并财务报表附注—应付职工薪酬”中查到；也可用行情软件的 F10 → 公司概况。")
+
     st.caption("阈值可在「设置」页调整；这里点一下就用当前阈值运行。")
     if st.button("开始排雷", type="primary", use_container_width=True):
         start_job(["fraud"], {"fraud": {}})
@@ -677,6 +806,7 @@ with tabs[3]:
         comps = res.get("companies") or []
         if comps:
             st.dataframe(pd.DataFrame(comps), use_container_width=True, hide_index=True)
+        render_result_downloads("造假排雷报告", [C.DIR_FRAUD])
 
 # ---------------- 16维度 ----------------
 with tabs[4]:
@@ -688,6 +818,7 @@ with tabs[4]:
     if snap and snap.get("result"):
         res = (snap["result"].get("results") or {}).get("dim16") or {}
         st.success(f"生成 {len(res.get('files') or [])} 个行业报告")
+        render_result_downloads("16维度结果", [C.DIR_16DIM])
         if res.get("industries"):
             st.write("行业：" + "、".join(map(str, res["industries"])))
 
@@ -711,6 +842,7 @@ with tabs[5]:
             st.warning(res.get("reason"))
         else:
             st.success(f"生成 {len(res.get('reports') or [])} 份报告")
+        render_result_downloads("企业AI报告", [C.DIR_ENTERPRISE])
         if res.get("errors"):
             with st.expander("错误明细"):
                 st.write(res["errors"])
@@ -752,6 +884,7 @@ with tabs[6]:
         if macro:
             with st.expander("宏观与大盘指标"):
                 st.json(macro)
+        render_result_downloads("好价估值结果", [C.DIR_VALUATION])
 
 # ---------------- 设置 ----------------
 with tabs[7]:

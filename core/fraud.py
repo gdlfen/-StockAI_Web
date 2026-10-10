@@ -796,22 +796,42 @@ def execute_18_conditions_analysis(comp_code: str, comp_name: str, comp_industry
         prev_yr = all_years[prev_idx]
         c, p_prev = comp_data[curr_yr], comp_data[prev_yr]
 
-        emp_drop = safe_div2(p_prev.get("员工人数", 0) - c.get("员工人数", 0),
-                             max(p_prev.get("员工人数", 1), 1))
-        rev_inc = safe_div2(c.get("营业收入", 0) - p_prev.get("营业收入", 0), max(p_prev.get("营业收入", 1), 1))
-        yearly_results["C1_员工与营收背离"].append({"年度": curr_yr,
-                                                    "状态": "风险" if emp_drop > p["c1_emp_drop"] and rev_inc >
-                                                                      p["c1_rev_inc"] else "正常",
-                                                    "员工降幅(%)": emp_drop, "营收增幅(%)": rev_inc,
-                                                    "[说明]": "员工降幅与营收增幅背离"})
+        # ------------------------------------------------------------------
+        # 【云端版防护】C1 / C2 依赖“员工人数”，而免费公开数据源**没有员工人数**
+        # （桌面版来自年报 PDF 的“员工情况”章节；akshare 无对应可用接口）。
+        # 若缺该数据仍按 0 计算，会算出 “员工降幅=100%、营收增幅=1.1e13%” 这类垃圾值
+        # 并误报“触发预警”。因此这里如实标注“数据不足”，不参与风险判定。
+        # 有员工人数时（例如你自行补充了数据）行为与桌面版完全一致。
+        _c_emp, _p_emp = c.get("员工人数"), p_prev.get("员工人数")
+        _has_emp = bool(_c_emp) and bool(_p_emp)
+        # rev_inc 在 C1 与 C5 都要用，必须无条件先算出来（否则缺员工人数时 C5 会 UnboundLocalError）
+        rev_inc = safe_div2(c.get("营业收入", 0) - p_prev.get("营业收入", 0),
+                            max(p_prev.get("营业收入", 1), 1))
+        if not _has_emp:
+            yearly_results["C1_员工与营收背离"].append(
+                {"年度": curr_yr, "状态": "数据不足", "员工降幅(%)": None, "营收增幅(%)": rev_inc,
+                 "[说明]": "缺少员工人数（免费数据源不提供），本条无法判定"})
+        else:
+            emp_drop = safe_div2(_p_emp - _c_emp, max(_p_emp, 1))
+            yearly_results["C1_员工与营收背离"].append({"年度": curr_yr,
+                                                        "状态": "风险" if emp_drop > p["c1_emp_drop"] and rev_inc >
+                                                                          p["c1_rev_inc"] else "正常",
+                                                        "员工降幅(%)": emp_drop, "营收增幅(%)": rev_inc,
+                                                        "[说明]": "员工降幅与营收增幅背离"})
 
-        comp_salary = (c.get("支付职工现金", 0) + c.get("期末应付薪酬", 0) - c.get("期初应付薪酬", 0)) / max(
-            (p_prev.get("员工人数", 1) + c.get("员工人数", 1)) / 2, 1)
-        ind_salary = MACRO_DB["默认_平均工资"].get(str(curr_yr), 100000)
-        sal_diff = safe_div2(ind_salary - comp_salary, max(ind_salary, 1))
-        yearly_results["C2_人均薪酬异常"].append(
-            {"年度": curr_yr, "状态": "风险" if sal_diff > p["c2_salary_diff"] else "正常",
-             "自身人均(元)": comp_salary, "行业均值(元)": ind_salary, "[说明]": "低于行业平均"})
+        if not _has_emp:
+            yearly_results["C2_人均薪酬异常"].append(
+                {"年度": curr_yr, "状态": "数据不足", "自身人均(元)": None,
+                 "行业均值(元)": MACRO_DB["默认_平均工资"].get(str(curr_yr), 100000),
+                 "[说明]": "缺少员工人数（免费数据源不提供），本条无法判定"})
+        else:
+            comp_salary = (c.get("支付职工现金", 0) + c.get("期末应付薪酬", 0) - c.get("期初应付薪酬", 0)) / max(
+                (_p_emp + _c_emp) / 2, 1)
+            ind_salary = MACRO_DB["默认_平均工资"].get(str(curr_yr), 100000)
+            sal_diff = safe_div2(ind_salary - comp_salary, max(ind_salary, 1))
+            yearly_results["C2_人均薪酬异常"].append(
+                {"年度": curr_yr, "状态": "风险" if sal_diff > p["c2_salary_diff"] else "正常",
+                 "自身人均(元)": comp_salary, "行业均值(元)": ind_salary, "[说明]": "低于行业平均"})
 
         yearly_results["C3_关联交易"].append(
             {"年度": curr_yr, "状态": "正常", "关联交易笔数": 0, "[说明]": "无重大异常"})
@@ -1141,7 +1161,8 @@ def process_task(in_path: str, out_path: str, current_params: Dict[str, Any],
 
 def run_all(input_dir: str, output_dir: str, params: Dict[str, Any],
             log: Optional[Callable[[str], None]] = None,
-            progress: Optional[Callable[[int, int, str], None]] = None) -> Dict[str, Any]:
+            progress: Optional[Callable[[int, int, str], None]] = None,
+            employee_supplement: Optional[Dict[str, Dict[int, int]]] = None) -> Dict[str, Any]:
     """全流程：抽取 -> 逐家判断 -> 逐家出报告，报告写到 ``output_dir/造假排雷结果/``。
 
     返回::
@@ -1190,6 +1211,15 @@ def run_all(input_dir: str, output_dir: str, params: Dict[str, Any],
             return {"ok": False, "error": "未提取到有效数据", "reports": reports,
                     "companies": companies, "skipped": skipped, "output_dir": main_out,
                     "total": 0, "analyzed": 0}
+
+        # 【员工人数补充】把用户提供的历年员工人数注入，恢复 C1/C2 的桌面版口径判定。
+        _supp = employee_supplement or {}
+        if _supp:
+            try:
+                from .employee_data import merge_into_company_data
+                merge_into_company_data(all_data, _supp, log_fn)
+            except Exception as e:  # noqa: BLE001
+                log_fn(f"⚠️ 员工人数补充数据合并失败（继续按缺数据处理）：{type(e).__name__}: {str(e)[:100]}")
 
         target_companies = list(all_data.keys())
         total = len(target_companies)

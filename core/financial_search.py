@@ -337,23 +337,39 @@ def fetch_employee_info(code: str, cache: DiskCache,
             log(f"   ⚠️ 公司概况获取失败[{code}]: {type(e).__name__}: {str(e)[:100]}")
 
     # 现金流量表里的“支付给职工以及为职工支付的现金”按年落到员工表（下游/报告都会用到）
+    # 注意：必须按 (年份, 项目) 去重再追加 —— 否则命中缓存时会把同样的年度再写一遍，
+    # 导致《员工情况(PDF提取)》出现完全重复的行（实测每行重复 2 次）。
     if cash_flow_sheet is not None and not cash_flow_sheet.empty:
         for key_name in ("支付给职工以及为职工支付的现金", "支付给职工以及为职工支付的现金(元)"):
             hit = cash_flow_sheet[cash_flow_sheet[STATEMENT_KEY_COL] == key_name]
             if hit.empty:
                 continue
             row = hit.iloc[0]
+            seen = {(str(r.get("年份")), str(r.get("项目"))) for r in recs}
             for col in cash_flow_sheet.columns:
                 if col == STATEMENT_KEY_COL:
                     continue
                 m = re.match(r"^(20\d{2})", str(col))
                 v = safe_float(row[col])
                 if m and v:
-                    recs.append({"年份": int(m.group(1)),
-                                 "项目": "支付给职工以及为职工支付的现金", "数值": v})
+                    item = {"年份": int(m.group(1)),
+                            "项目": "支付给职工以及为职工支付的现金", "数值": v}
+                    if (str(item["年份"]), item["项目"]) not in seen:
+                        recs.append(item)
+                        seen.add((str(item["年份"]), item["项目"]))
             break
 
+    # 最终再去重一次（防止历史缓存里已经存了重复行）
     if recs:
+        _seen = set()
+        _uniq = []
+        for r in recs:
+            k2 = (str(r.get("年份")), str(r.get("项目")))
+            if k2 in _seen:
+                continue
+            _seen.add(k2)
+            _uniq.append(r)
+        recs = _uniq
         cache.set(key, recs)
     return pd.DataFrame(recs, columns=["年份", "项目", "数值"])
 
@@ -670,7 +686,18 @@ def run_annual_report_search(targets: List[Dict[str, Any]], output_root: str, ca
 
     this_year = time.localtime().tm_year
     end_y = int(end_year or this_year)
+    # 【年度夹取】当年年报通常要到次年 4 月底才披露完，请求“当年”只会得到空表
+    # （用户反馈“提取表只有一个数字且没有表头”即由此产生）。
+    # 因此把结束年度限制在“去年”，除非用户明确要求当年且当前已是年末。
+    _now_month = time.localtime().tm_mon
+    _latest_full = this_year - 1
+    if end_y >= this_year and _now_month < 12:
+        log(f"   ℹ️ 结束年度 {end_y} 的年度报告通常尚未披露（当年年报多在次年 4 月底前披露完），"
+            f"已自动调整结束年度为 {_latest_full}。如需包含 {end_y} 年的中期数据请到“年报数据”页手工设置。")
+        end_y = _latest_full
     start_y = int(start_year or (end_y - max(1, int(years_back)) + 1))
+    if start_y > end_y:
+        start_y = end_y
     log(f"🔄 年报数据搜索汇总启动：区间 {start_y}-{end_y}，共 {len(targets)} 家目标公司")
 
     generated: List[str] = []
