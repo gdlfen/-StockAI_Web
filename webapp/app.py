@@ -702,6 +702,7 @@ with tabs[1]:
             st.download_button("下载《海选公司汇总表》CSV",
                                df.to_csv(index=False).encode("utf-8-sig"),
                                file_name="海选公司汇总表.csv", mime="text/csv")
+        detail = res.get("detail") or []
         if detail:
             with st.expander(f"查看全部候选明细（{len(detail)} 家，含未通过原因）", expanded=not stocks):
                 st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
