@@ -61,6 +61,8 @@ try:
     from core import contracts as C             # noqa: E402
     from core import pipeline as pipe           # noqa: E402
     from core.common import DiskCache, make_logger  # noqa: E402
+    # 海选条件设置面板需要把“文字模板”解析成结构化条件
+    from core.screening import parse_query as screening_parse_query  # noqa: E402
 except ModuleNotFoundError as _imp_err:         # noqa: F841
     st.set_page_config(page_title="启动失败", page_icon="⚠️", layout="centered")
     st.error("### 未找到项目代码目录 `core/`，无法启动")
@@ -90,6 +92,29 @@ except ModuleNotFoundError as _imp_err:         # noqa: F841
 
 st.set_page_config(page_title="价值投资智能分析（云端版）", page_icon="📈",
                    layout="wide", initial_sidebar_state="collapsed")
+
+# 手机端版面优化：标题字号整体小一号（h1 1.75rem→1.35rem），减少竖屏占用
+st.markdown(
+    """
+    <style>
+      /* 大标题与章节标题统一缩小一档，手机竖屏更省空间 */
+      h1, .stMarkdown h1 { font-size: 1.35rem !important; line-height: 1.35 !important;
+                           margin: 0.2rem 0 0.4rem 0 !important; }
+      h2, .stMarkdown h2 { font-size: 1.18rem !important; }
+      h3, .stMarkdown h3 { font-size: 1.06rem !important; }
+      /* Streamlit 自带的超大标题 */
+      [data-testid="stHeading"] h1, [data-testid="stHeadingWithActionElements"] h1 {
+                           font-size: 1.35rem !important; }
+      [data-testid="stHeading"] h2 { font-size: 1.18rem !important; }
+      /* 手机端进一步收紧内边距 */
+      @media (max-width: 640px) {
+        .block-container { padding: 1rem 0.8rem 2rem 0.8rem !important; }
+        h1, .stMarkdown h1, [data-testid="stHeading"] h1 { font-size: 1.2rem !important; }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ======================================================================
 # 会话级数据目录（云端文件系统不保证持久，故每次会话独立，并支持一键打包下载）
@@ -185,6 +210,9 @@ class LocalJob:
         self.result: Optional[Dict[str, Any]] = None
         self.error = ""
         self.started_at = self.finished_at = None
+        # 协作式暂停 / 停止（与 server.jobs.Job 同一套语义）
+        self.pause_flag = False
+        self.stop_flag = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -192,12 +220,34 @@ class LocalJob:
     def log(self, msg: str) -> None:
         self.logs.append(str(msg))
 
+    def checkpoint(self) -> None:
+        """暂停时阻塞；停止时抛出中断。放在循环边界，安全且不破坏数据。"""
+        while self.pause_flag and not self.stop_flag:
+            time.sleep(0.3)
+        if self.stop_flag:
+            raise KeyboardInterrupt("用户停止任务")
+
     def progress(self, done: int, total: int, label: str = "") -> None:
         self.step_done, self.step_total, self.step_label = done, total, label
+        self.checkpoint()
+
+    def set_paused(self, paused: bool) -> None:
+        self.pause_flag = bool(paused)
+        if paused and self.status == "running":
+            self.status = "paused"
+        elif not paused and self.status == "paused":
+            self.status = "running"
+
+    def stop(self) -> None:
+        self.stop_flag = True
+        self.pause_flag = False
+        self.status = "cancelled"
+        self.log("⏹️ 已请求停止，将在当前这一步完成后中断…")
 
     def snapshot(self) -> Dict[str, Any]:
         return {
             "id": self.id, "status": self.status,
+            "paused": self.pause_flag, "stopping": self.stop_flag,
             "stage_index": self.stage_index, "stage_total": self.stage_total,
             "stage_name": self.stage_name,
             "step_done": self.step_done, "step_total": self.step_total, "step_label": self.step_label,
@@ -213,6 +263,12 @@ class LocalJob:
             cfg = _cfg()
             results: Dict[str, Any] = {}
             for idx, key in enumerate(self.stage_keys):
+                try:
+                    self.checkpoint()
+                except KeyboardInterrupt:
+                    self.log("⏹️ 任务已停止。")
+                    self.status = "cancelled"
+                    return
                 self.stage_index = idx + 1
                 self.stage_name = next((s["name"] for s in pipe.STAGES if s["key"] == key), key)
                 self.step_done = self.step_total = 0
@@ -227,6 +283,10 @@ class LocalJob:
                     continue
                 try:
                     res = fn(ctx, sp)
+                except KeyboardInterrupt:
+                    self.log("⏹️ 任务已被用户停止（当前阶段中断，已生成的产物会保留）。")
+                    self.status = "cancelled"
+                    return
                 except Exception as e:  # noqa: BLE001
                     import traceback
                     self.log(f"❌ {self.stage_name} 失败：{type(e).__name__}: {e}")
@@ -288,7 +348,7 @@ def _current_job():
 
 
 def render_job_progress() -> Optional[Dict[str, Any]]:
-    """展示运行进度；完成时返回结果快照。"""
+    """展示运行进度 + 暂停/停止控制；完成时返回结果快照。"""
     job = _current_job()
     if job is None:
         return None
@@ -298,15 +358,32 @@ def render_job_progress() -> Optional[Dict[str, Any]]:
         st.error(f"读取任务状态失败：{e}")
         return None
     status = snap.get("status")
-    label_map = {"pending": "排队中", "running": "运行中", "done": "已完成",
-                 "failed": "失败", "cancelled": "已取消"}
+    label_map = {"pending": "排队中", "running": "运行中", "paused": "已暂停",
+                 "done": "已完成", "failed": "失败", "cancelled": "已停止"}
     st.info(f"任务 {snap.get('id')} · 状态：**{label_map.get(status, status)}** · "
             f"阶段 {snap.get('stage_index')}/{snap.get('stage_total')} {snap.get('stage_name')} · "
             f"用时 {snap.get('elapsed', 0):.0f}s")
     if snap.get("step_total"):
         st.progress(min(1.0, snap["step_done"] / max(1, snap["step_total"])),
                     text=f"{snap['step_label']} ({snap['step_done']}/{snap['step_total']})")
-    with st.expander("📜 运行日志", expanded=(status == "running")):
+
+    # ---------- 暂停 / 停止 ----------
+    if status in ("running", "paused", "pending"):
+        _paused = bool(snap.get("paused")) or status == "paused"
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            _lbl = "▶️ 继续运行" if _paused else "⏸️ 暂停"
+            if st.button(_lbl, use_container_width=True, key="job_pause_btn",
+                         help="暂停采用“检查点”方式：当前这一步（如一次网络请求）跑完后挂起，不会丢数据"):
+                _set_paused(not _paused)
+                st.rerun()
+        with _c2:
+            if st.button("⏹️ 停止", use_container_width=True, key="job_stop_btn",
+                         help="立即停止后续处理；已经生成的产物文件会保留"):
+                _stop_job()
+                st.rerun()
+
+    with st.expander("📜 运行日志", expanded=(status in ("running", "paused", "pending"))):
         st.code("\n".join(snap.get("logs", [])[-400:]) or "（暂无日志）")
     if status in ("done", "failed", "cancelled"):
         return snap
@@ -314,6 +391,35 @@ def render_job_progress() -> Optional[Dict[str, Any]]:
     time.sleep(1.5)
     st.rerun()
     return None
+
+
+def _set_paused(paused: bool) -> None:
+    """暂停 / 继续当前任务（内置模式直接改标志，远程模式走 API）。"""
+    job = _current_job()
+    if job is None:
+        return
+    if MODE_LOCAL:
+        job.set_paused(paused)
+    else:
+        try:
+            api("POST", f"/api/jobs/{st.session_state.get('job_id')}/pause",
+                params={"paused": "true" if paused else "false"})
+        except Exception as e:  # noqa: BLE001
+            st.error(f"暂停请求失败：{e}")
+
+
+def _stop_job() -> None:
+    """停止当前任务。"""
+    job = _current_job()
+    if job is None:
+        return
+    if MODE_LOCAL:
+        job.stop()
+    else:
+        try:
+            api("POST", f"/api/jobs/{st.session_state.get('job_id')}/cancel")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"停止请求失败：{e}")
 
 
 # ======================================================================
@@ -420,16 +526,102 @@ with tabs[1]:
     st.markdown("#### 🎯 海选公司（免费数据源）")
     st.caption("用 AkShare 全市场数据按条件筛选，替代原桌面版的问财浏览器抓取。")
     cfg = _cfg()
-    preset = st.selectbox("条件模板", list(cfg_mod.HAIXUAN_PRESETS.keys()), index=0)
-    query = st.text_area("筛选条件（可自由编辑）", value=cfg_mod.HAIXUAN_PRESETS[preset], height=90)
-    pool = st.slider("候选池大小", 20, 1000, 200, 20)
-    if st.button("开始海选", type="primary", use_container_width=True):
-        start_job(["haixuan"], {"haixuan": {"query": query, "pool_size": int(pool)}})
+
+    # ============ 筛选条件设置 ============
+    _hc = dict(cfg_mod.default_haixuan_conditions())
+    _hc.update(cfg.get("haixuan_conditions") or {})
+    _presets = cfg_mod.HAIXUAN_PRESETS
+
+    st.markdown("##### ⚙️ 筛选条件设置")
+    _c1, _c2 = st.columns([1, 1])
+    with _c1:
+        _preset_name = st.selectbox(
+            "条件模板（套用后仍可逐条微调）", ["自定义"] + list(_presets.keys()),
+            index=0, key="hx_preset_pick",
+            help="选择模板会把该模板的条件填入下方；选“自定义”则保持当前值。")
+    with _c2:
+        _hc["years"] = st.number_input(
+            "连续年数（最近 N 个完整会计年度都要满足）", 1, 10,
+            int(_hc.get("years") or 5), 1, key="hx_years")
+
+    # 套用模板：解析模板文本 → 覆盖面板默认值
+    if _preset_name != "自定义":
+        _tpl_cond = screening_parse_query(_presets[_preset_name], default_years=int(_hc.get("years") or 5))
+        for _k in ("min_roe", "min_cash_content", "min_gross_margin", "min_listed_years",
+                   "min_market_cap", "max_pe"):
+            if _tpl_cond.get(_k) is not None:
+                _hc[_k] = float(_tpl_cond[_k])
+        for _k in ("exclude_bj", "exclude_finance", "exclude_st"):
+            if _tpl_cond.get(_k):
+                _hc[_k] = True
+
+    st.caption("下面每一项填 **0 表示不启用**该条件；全部为 0 时只按候选池输出。")
+    _g1, _g2 = st.columns(2)
+    with _g1:
+        _hc["min_roe"] = st.number_input("① 加权净资产收益率(ROE) >", 0.0, 200.0,
+                                        float(_hc.get("min_roe") or 0.0), 1.0,
+                                        key="hx_roe", help="取“加权净资产收益率”，缺失时回退“净资产收益率”")
+        _hc["min_cash_content"] = st.number_input("③ 净利润现金含量 >", 0.0, 1000.0,
+                                                 float(_hc.get("min_cash_content") or 0.0), 5.0,
+                                                 key="hx_cash", help="经营现金净流量÷净利润；>100% 表示利润有现金支撑")
+        _hc["min_market_cap"] = st.number_input("⑤ 总市值 >（亿元）", 0.0, 100000.0,
+                                               float(_hc.get("min_market_cap") or 0.0), 10.0,
+                                               key="hx_cap", help="0 表示不限")
+    with _g2:
+        _hc["min_gross_margin"] = st.number_input("② 销售毛利率 >", 0.0, 100.0,
+                                                 float(_hc.get("min_gross_margin") or 0.0), 1.0,
+                                                 key="hx_gm", help="按利润表口径：(营业收入−营业成本)/营业收入")
+        _hc["min_listed_years"] = st.number_input("④ 上市时间 >（年）", 0.0, 30.0,
+                                                 float(_hc.get("min_listed_years") or 0.0), 0.5,
+                                                 key="hx_listed",
+                                                 help="按**精确上市日期**计算已上市年数（数据来自巨潮公司概况，逐只带缓存）")
+        _hc["max_pe"] = st.number_input("⑥ 市盈率(TTM) <（倍）", 0.0, 500.0,
+                                       float(_hc.get("max_pe") or 0.0), 1.0,
+                                       key="hx_pe", help="0 表示不限；启用后会逐只取实时 PE")
+
+    _e1, _e2, _e3 = st.columns(3)
+    with _e1:
+        _hc["exclude_bj"] = st.checkbox("剔除北交所", value=bool(_hc.get("exclude_bj", True)), key="hx_bj")
+    with _e2:
+        _hc["exclude_finance"] = st.checkbox("剔除金融股", value=bool(_hc.get("exclude_finance", True)), key="hx_fin")
+    with _e3:
+        _hc["exclude_st"] = st.checkbox("剔除 ST/*ST", value=bool(_hc.get("exclude_st", True)), key="hx_st")
+
+    _pool = st.slider("候选池大小（按总市值降序取前 N 只参与筛选）", 20, 1000,
+                      int(cfg.get("haixuan_pool_size") or 200), 20, key="hx_pool",
+                      help="越大越全但更慢；手机端建议 100~300")
+
+    _cond_text = cfg_mod.conditions_to_query(_hc)
+    if _cond_text:
+        st.success(f"**当前生效条件**：{_cond_text}　（连续 {int(_hc.get('years') or 5)} 年）")
+    else:
+        st.warning("当前未设置任何阈值条件（全部为 0），将直接输出候选池前 N 只。")
+
+    _b1, _b2 = st.columns([1, 1])
+    with _b1:
+        if st.button("🚀 开始海选", type="primary", use_container_width=True, key="hx_run"):
+            start_job(["haixuan"], {"haixuan": {"conditions": _hc, "pool_size": int(_pool)}})
+    with _b2:
+        if st.button("💾 保存为我的默认条件", use_container_width=True, key="hx_save"):
+            cfg["haixuan_conditions"] = _hc
+            cfg["haixuan_pool_size"] = int(_pool)
+            cfg["haixuan_query"] = _cond_text or cfg.get("haixuan_query")
+            cfg_mod.save_user_config(_session_dir(), cfg)
+            st.session_state.user_config = cfg
+            st.success("已保存，下次进入本页会自动带出。")
+
+    with st.expander("🛠 高级：直接用文字条件（与原桌面版问财写法一致）"):
+        st.caption("填了文字条件时，**以文字条件为准**（适合“连续3年股息率>5%”这类本面板未覆盖的条件）。")
+        _tq = st.text_area("文字条件", value="", height=80, key="hx_textq",
+                           placeholder="连续5年加权roe>20，连续5年净利润现金含量>100，连续5年毛利率>40，剔除北交所，非金融股")
+        if _tq.strip() and st.button("用文字条件运行海选", use_container_width=True, key="hx_run_text"):
+            start_job(["haixuan"], {"haixuan": {"query": _tq, "pool_size": int(_pool)}})
+
     snap = render_job_progress()
     if snap and snap.get("result"):
         res = (snap["result"].get("results") or {}).get("haixuan") or {}
         stocks = res.get("stocks") or []
-        st.success(f"入选 {len(stocks)} 只（候选 {res.get('candidates')} 只）")
+        st.success(f"入选 {len(stocks)} 只（候选 {res.get('candidates')} 只）｜条件：{res.get('condition_text') or _cond_text}")
         if stocks:
             df = pd.DataFrame(stocks)
             st.dataframe(df, use_container_width=True, hide_index=True)
@@ -438,7 +630,7 @@ with tabs[1]:
                                file_name="海选公司汇总表.csv", mime="text/csv")
         detail = res.get("detail") or []
         if detail:
-            with st.expander("查看全部候选明细（含未通过原因）"):
+            with st.expander(f"查看全部候选明细（{len(detail)} 家，含未通过原因）", expanded=not stocks):
                 st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
 
 # ---------------- 年报数据 ----------------

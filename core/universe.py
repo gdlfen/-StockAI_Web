@@ -143,31 +143,52 @@ class StockUniverse:
 # ======================================================================
 # 行业分类
 # ======================================================================
+# 行业接口连续失败达到该次数后，本轮不再尝试东财（直接走更快的巨潮回退），
+# 避免每家公司都白等 30~40 秒。下次运行（进程重启）会自动重试。
+_IND_FAIL_STREAK = {"n": 0, "skip_em": False}
+_IND_FAIL_LIMIT = 3
+
+
 def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None]] = None,
-                 retries: int = 2) -> Dict[str, str]:
+                 retries: int = 1, timeout: int = 8) -> Dict[str, str]:
     """取单只股票的行业信息。返回
     {"一级行业":..., "二级行业":..., "三级行业":..., "完整行业路径":...}
+
+    容错设计（针对东财 datacenter 频繁超时）：
+    1. 命中缓存直接返回；
+    2. 东财接口超时/失败时**写入短期负缓存**，避免同一只股票在本轮反复重试；
+    3. 连续失败达 `_IND_FAIL_LIMIT` 次后，本轮直接跳过东财、走巨潮回退（每次约 0.3s）；
+    4. 全部失败返回空 dict，由调用方用“默认行业”兜底，**绝不阻塞主流程**。
     """
     log = log or make_logger()
     code = str(code).zfill(6)
     key = f"industry_{code}"
     hit = cache.get(key)
-    if hit:
+    if isinstance(hit, dict):
         return hit
+    # 短期负缓存：同一只股票本轮不再重复请求
+    if cache.get(f"industry_fail_{code}"):
+        neg = cache.get(key)
+        if isinstance(neg, dict):
+            return neg
+        return {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
 
     result: Dict[str, str] = {"一级行业": "", "二级行业": "", "三级行业": "", "完整行业路径": ""}
 
-    # ① 东方财富 F10（原桌面版即用此接口，稳定且分级清晰）
-    try:
-        secucode = f"{code}.SH" if code[0] in ("6", "9") else (f"{code}.BJ" if code[0] in ("4", "8") else f"{code}.SZ")
-        r = http_get(EM_DATACENTER, params={
-            "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
-            "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,BOARD_NAME,BOARD_CODE,BOARD_TYPE,BOARD_RANK",
-            "filter": f'(SECUCODE="{secucode}")',
-            "pageNumber": 1, "pageSize": 200, "source": "WEB", "client": "WEB",
-        }, timeout=15, retries=retries, label=f"东财行业[{code}]", log=log)
-        if r is not None:
-            rows = (((r.json() or {}).get("result") or {}).get("data")) or []
+    # ① 东方财富 F10（分级最清晰，但可能超时）
+    if not _IND_FAIL_STREAK["skip_em"]:
+        try:
+            secucode = (f"{code}.SH" if code[0] in ("6", "9")
+                        else (f"{code}.BJ" if code[0] in ("4", "8") else f"{code}.SZ"))
+            r = http_get(EM_DATACENTER, params={
+                "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
+                "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,BOARD_NAME,BOARD_CODE,BOARD_TYPE,BOARD_RANK",
+                "filter": f'(SECUCODE="{secucode}")',
+                "pageNumber": 1, "pageSize": 200, "source": "WEB", "client": "WEB",
+            }, timeout=timeout, retries=retries, label=f"东财行业[{code}]", log=log)
+            rows = []
+            if r is not None:
+                rows = (((r.json() or {}).get("result") or {}).get("data")) or []
             ranked: List[Tuple[int, str]] = []
             for it in rows:
                 name = str(it.get("BOARD_NAME") or "").strip()
@@ -180,12 +201,19 @@ def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None
                 result["一级行业"] = names[0] if len(names) > 0 else ""
                 result["二级行业"] = names[1] if len(names) > 1 else result["一级行业"]
                 result["三级行业"] = names[2] if len(names) > 2 else result["二级行业"]
-                # 与原桌面版一致：文件夹用“二级行业”（无二级则一级）
                 result["完整行业路径"] = "-".join([n for n in names[:3] if n])
-    except Exception as e:  # noqa: BLE001
-        log(f"⚠️ 东财行业分类失败[{code}]: {type(e).__name__}: {str(e)[:100]}")
+                _IND_FAIL_STREAK["n"] = 0
+            else:
+                _IND_FAIL_STREAK["n"] += 1
+        except Exception as e:  # noqa: BLE001
+            _IND_FAIL_STREAK["n"] += 1
+            log(f"⚠️ 东财行业分类失败[{code}]: {type(e).__name__}: {str(e)[:80]}")
+        if _IND_FAIL_STREAK["n"] >= _IND_FAIL_LIMIT and not _IND_FAIL_STREAK["skip_em"]:
+            _IND_FAIL_STREAK["skip_em"] = True
+            log(f"   ℹ️ 东财行业接口连续失败 {_IND_FAIL_STREAK['n']} 次，本轮改用巨潮行业分类"
+                f"（更快，每次约 0.3 秒；下次重启会自动重试东财）")
 
-    # ② 回退：巨潮行业分类
+    # ② 回退：巨潮行业分类（约 0.3s，稳定）
     if not result["一级行业"]:
         try:
             import akshare as ak
@@ -200,12 +228,15 @@ def get_industry(code: str, cache: DiskCache, log: Optional[Callable[[str], None
                 result["完整行业路径"] = "-".join(
                     [result["一级行业"], result["二级行业"], result["三级行业"]]).strip("-")
         except Exception as e:  # noqa: BLE001
-            log(f"⚠️ 巨潮行业分类失败[{code}]: {type(e).__name__}: {str(e)[:100]}")
+            log(f"⚠️ 巨潮行业分类失败[{code}]: {type(e).__name__}: {str(e)[:80]}")
 
     if result["一级行业"] and not result["二级行业"]:
         result["二级行业"] = result["一级行业"]
     if result["一级行业"]:
         cache.set(key, result)
+    else:
+        # 记一笔短期负缓存（用极短 TTL 的独立键），避免本轮反复重试
+        cache.set(f"industry_fail_{code}", 1)
     return result
 
 

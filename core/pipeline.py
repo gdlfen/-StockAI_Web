@@ -67,7 +67,9 @@ def _log_stage(ctx: PipelineContext, name: str) -> None:
 def stage_haixuan(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]:
     from . import screening
     _log_stage(ctx, "1. 海选公司（免费数据）")
+    # 条件来源优先级：本次调用传入的结构化条件 > 传入的文本 > 用户配置里的结构化条件 > 配置文本 > 内置默认
     query = params.get("query") or ctx.config.get("haixuan_query") or cfg_mod.DEFAULT_WENCAI_QUERY
+    conditions = params.get("conditions") or ctx.config.get("haixuan_conditions")
     pool = int(params.get("pool_size") or 300)
     ds_cfg = dict(ctx.config.get("data_source") or cfg_mod.DATA_SOURCE_DEFAULTS)
     ds_cfg.update(params.get("data_source") or {})
@@ -77,6 +79,7 @@ def stage_haixuan(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any
         log=ctx.log, progress=ctx.progress,
         extra_codes=params.get("extra_codes"),
         ds_cfg=ds_cfg,
+        conditions=conditions,
     )
     return res
 

@@ -13,10 +13,12 @@
 """
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date as _date
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -51,15 +53,17 @@ def parse_query(query: str, default_years: int = 5) -> Dict[str, Any]:
     """
     q = str(query or "").replace("％", "%").replace("，", ",")
     conds: Dict[str, Any] = {"years": default_years, "exclude_bj": False, "exclude_finance": False,
-                             "min_roe": None, "min_gross_margin": None, "min_cash_content": None,
-                             "min_listed_years": None, "min_market_cap": None, "max_pe": None,
-                             "unparsed": []}
+                             "exclude_st": False, "min_roe": None, "min_gross_margin": None,
+                             "min_cash_content": None, "min_listed_years": None,
+                             "min_market_cap": None, "max_pe": None, "unparsed": []}
 
     # 剔除类
     if "北交所" in q:
         conds["exclude_bj"] = True
     if "非金融" in q or "剔除金融" in q or "不含金融" in q:
         conds["exclude_finance"] = True
+    if "ST" in q.upper():
+        conds["exclude_st"] = True
 
     # 连续N年
     m = re.search(r"连续\s*(\d+)\s*年", q)
@@ -75,40 +79,80 @@ def parse_query(query: str, default_years: int = 5) -> Dict[str, Any]:
         except Exception:
             return None
 
-    conds["min_roe"] = _num(r"(?:加权)?\s*roe\s*[>＞=]+\s*([\d\.]+)")
+    # 比较符兼容：> ＞ 大于 ≥ >=；< ＜ 小于 ≤ <=
+    _GT = r"(?:>|＞|大于等于|不小于|≥|>=|大于)"
+    _LT = r"(?:<|＜|小于等于|不超过|≤|<=|小于)"
+    conds["min_roe"] = _num(r"(?:加权)?\s*roe\s*" + _GT + r"\s*([\d\.]+)")
     if conds["min_roe"] is None:
-        conds["min_roe"] = _num(r"净资产收益率\s*[>＞=]+\s*([\d\.]+)")
-    conds["min_gross_margin"] = _num(r"毛利率\s*[>＞=]+\s*([\d\.]+)")
-    conds["min_cash_content"] = _num(r"净利润现金含量\s*[>＞=]+\s*([\d\.]+)")
-    conds["min_listed_years"] = _num(r"上市时间\s*[>＞=]+\s*([\d\.]+)")
-    conds["min_market_cap"] = _num(r"市值\s*[>＞=]+\s*([\d\.]+)")
-    conds["max_pe"] = _num(r"(?:市盈率|pe)\s*[<＜=]+\s*([\d\.]+)")
+        conds["min_roe"] = _num(r"净资产收益率\s*" + _GT + r"\s*([\d\.]+)")
+    conds["min_gross_margin"] = _num(r"毛利率\s*" + _GT + r"\s*([\d\.]+)")
+    conds["min_cash_content"] = _num(r"净利润现金含量\s*" + _GT + r"\s*([\d\.]+)")
+    conds["min_listed_years"] = _num(r"上市时间\s*" + _GT + r"\s*([\d\.]+)")
+    conds["min_market_cap"] = _num(r"市值\s*" + _GT + r"\s*([\d\.]+)")
+    conds["max_pe"] = _num(r"(?:市盈率|pe)\s*" + _LT + r"\s*([\d\.]+)")
 
-    known = ["roe", "毛利率", "净利润现金含量", "上市时间", "市值", "市盈率", "北交所", "金融", "连续"]
+    # 面板未覆盖、但值得提示用户“已忽略”的常见条件关键词
+    known = ["roe", "毛利率", "净利润现金含量", "上市时间", "市值", "市盈率", "pe",
+             "北交所", "金融", "连续", "st", "股息率", "营收", "收入", "净利", "量价"]
     for part in [x for x in re.split(r"[,\n;；]", q) if x.strip()]:
         if not any(k in part.lower() for k in known):
             conds["unparsed"].append(part.strip())
     return conds
 
 
+def normalize_conditions(conds: Optional[Dict[str, Any]], fallback_query: str = "") -> Dict[str, Any]:
+    """把「结构化条件字典」规整成完整条件；缺项时由 fallback_query 文本兜底。
+
+    这是前端【筛选条件设置】面板的入口：面板给的就是结构化字典。
+    """
+    base = parse_query(fallback_query or "")
+    out = dict(base)
+    for k, v in (conds or {}).items():
+        if k in ("unparsed",):
+            continue
+        if k in ("exclude_bj", "exclude_finance", "exclude_st"):
+            out[k] = bool(v)
+        elif k == "years":
+            try:
+                out[k] = max(1, min(10, int(v or 5)))
+            except Exception:
+                pass
+        else:
+            try:
+                fv = float(v)
+                out[k] = fv if fv > 0 else None
+            except Exception:
+                pass
+    out["unparsed"] = []
+    return out
+
+
 def conditions_to_text(c: Dict[str, Any]) -> str:
+    """把结构化条件渲染成可读文本（供日志/报告/前端展示）。
+
+    注意：与 `core.config.conditions_to_query` 保持同一口径 —— 两处都会出现在页面上，
+    任何一处漏项都会让用户以为条件没生效。
+    """
     parts = []
+    years = c.get("years", 5)
     if c.get("min_roe") is not None:
-        parts.append(f"连续{c['years']}年加权ROE>{c['min_roe']}")
+        parts.append(f"连续{years}年加权ROE>{c['min_roe']:g}")
     if c.get("min_cash_content") is not None:
-        parts.append(f"连续{c['years']}年净利润现金含量>{c['min_cash_content']}")
+        parts.append(f"连续{years}年净利润现金含量>{c['min_cash_content']:g}")
     if c.get("min_gross_margin") is not None:
-        parts.append(f"连续{c['years']}年毛利率>{c['min_gross_margin']}")
+        parts.append(f"连续{years}年毛利率>{c['min_gross_margin']:g}")
     if c.get("min_listed_years") is not None:
-        parts.append(f"上市时间>{c['min_listed_years']}年")
+        parts.append(f"上市时间>{c['min_listed_years']:g}年")
     if c.get("min_market_cap") is not None:
-        parts.append(f"市值>{c['min_market_cap']}亿")
+        parts.append(f"总市值>{c['min_market_cap']:g}亿")
     if c.get("max_pe") is not None:
-        parts.append(f"市盈率<{c['max_pe']}")
+        parts.append(f"市盈率<{c['max_pe']:g}")
     if c.get("exclude_bj"):
         parts.append("剔除北交所")
     if c.get("exclude_finance"):
         parts.append("非金融股")
+    if c.get("exclude_st"):
+        parts.append("剔除ST")
     return "，".join(parts)
 
 
@@ -203,6 +247,94 @@ def _fix_code(v: Any) -> str:
     return s.zfill(6) if s else ""
 
 
+# ----------------------------------------------------------------------
+# 上市日期（精确）
+# ----------------------------------------------------------------------
+def fetch_listing_date(code: str, cache: DiskCache,
+                       log: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """取精确上市日期（返回 'YYYY-MM-DD'）。带磁盘缓存，取不到返回 None。"""
+    code = _fix_code(code)
+    if not code:
+        return None
+    key = f"listed_{code}"
+    hit = cache.get(key)
+    if isinstance(hit, str) and hit:
+        return hit
+    try:
+        import akshare as ak
+        df = ak.stock_profile_cninfo(symbol=code)
+        if df is not None and not df.empty and "上市日期" in df.columns:
+            raw = str(df.iloc[0]["上市日期"] or "").strip()
+            m = re.search(r"(\d{4})[-/年]?(\d{1,2})[-/月]?(\d{1,2})", raw)
+            if m:
+                val = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+                cache.set(key, val)
+                return val
+    except Exception as e:  # noqa: BLE001
+        (log or make_logger())(f"      ⚠️ 取上市日期失败[{code}]: {type(e).__name__}: {str(e)[:70]}")
+    return None
+
+
+def listing_years(listed: Optional[str], ref_date: Optional[str] = None) -> Optional[float]:
+    """按“自然年”计算已上市年数：整年数 + 剩余天数/365，保留 2 位小数。"""
+    if not listed:
+        return None
+    try:
+        y, m, d = (int(x) for x in listed.split("-")[:3])
+        start = datetime.date(y, m, d)
+        if ref_date:
+            ry, rm, rd = (int(x) for x in str(ref_date)[:10].split("-")[:3])
+            end = datetime.date(ry, rm, rd)
+        else:
+            end = datetime.date.today()
+        if end < start:
+            return 0.0
+        whole = end.year - start.year - ((end.month, end.day) < (start.month, start.day))
+        base = datetime.date(start.year + whole, start.month, start.day)
+        frac = (end - base).days / 365.0
+        return round(whole + frac, 2)
+    except Exception:
+        return None
+
+
+def fetch_listing_dates_batch(codes: List[str], cache: DiskCache, workers: int = 8,
+                             log: Optional[Callable[[str], None]] = None,
+                             budget_sec: float = 180.0) -> Dict[str, Optional[str]]:
+    """**串行**批量取上市日期（带缓存）。
+
+    ⚠️ 必须串行：`ak.stock_profile_cninfo` 内部使用 py_mini_racer（V8）解析 JS，
+    该引擎**不是线程安全的** —— 并发调用会导致进程在 `mini_racer.dll` 里直接崩溃
+    （实测：6 线程取 6 只即触发原生 crash，Python 层无法捕获）。
+    单只需要 0.3~0.4 秒，300 只约 2 分钟，配合磁盘缓存只在首次运行时付出这个代价。
+    """
+    log = log or make_logger()
+    out: Dict[str, Optional[str]] = {}
+    todo: List[str] = []
+    for c in codes:
+        c2 = _fix_code(c)
+        if not c2:
+            continue
+        hit = cache.get(f"listed_{c2}")
+        if isinstance(hit, str) and hit:
+            out[c2] = hit
+        else:
+            todo.append(c2)
+    if not todo:
+        return out
+
+    t0 = time.time()
+    done = 0
+    for c in todo:
+        if time.time() - t0 > budget_sec:
+            log(f"   ⚠️ 取上市日期已达时间预算 {budget_sec:.0f}s，剩余 {len(todo) - done} 只跳过（下次运行会用缓存补齐）")
+            break
+        out[c] = fetch_listing_date(c, cache, None)
+        done += 1
+    got = sum(1 for v in out.values() if v)
+    log(f"   已取到 {got}/{len(codes)} 只的精确上市日期（串行，耗时 {time.time()-t0:.0f}s）")
+    return out
+
+
 def gross_margin_map(code: str, cache: DiskCache, years: List[int],
                      log: Optional[Callable[[str], None]] = None) -> Dict[int, float]:
     """毛利率兜底：AkShare 的“销售毛利率”字段在新浪源里常年为空，
@@ -254,10 +386,16 @@ def build_candidate_pool(cond: Dict[str, Any], universe: StockUniverse, cache: D
         return []
 
     pool: List[Dict[str, Any]] = []
+    _unknown: List[str] = []
     df = df.copy()
     df["code"] = df["code"].astype(str).str.zfill(6)
     if cond.get("exclude_bj"):
         df = df[~df["code"].str.startswith(("4", "8", "92"))]
+    # 【筛选条件设置】剔除 ST / *ST / 退市整理
+    if cond.get("exclude_st"):
+        before = len(df)
+        df = df[~df["name"].astype(str).str.contains(r"ST|退", case=False, na=False, regex=True)]
+        log(f"   剔除 ST/退市股 {before - len(df)} 只")
 
     log(f"   候选池构建：全市场 {len(df)} 只，正在按市值排序…")
     # 【提速】先把已缓存的市值收集起来；未缓存的用**批量接口**一次补齐（腾讯行情支持多代码同查）
@@ -287,6 +425,13 @@ def build_candidate_pool(cond: Dict[str, Any], universe: StockUniverse, cache: D
                 enriched.append((code, str(row.get("name", "")), float(caps[code])))
     enriched.sort(key=lambda x: -x[2])
 
+    # 【精确上市时间】门槛在候选池阶段先筛掉不达标的，再逐只取上市日期，
+    # 只取到够 pool_size 只就停 —— 既不浪费指标请求，也避免无谓的网络请求。
+    need_listed = cond.get("min_listed_years") is not None
+    min_years = float(cond["min_listed_years"]) if need_listed else 0.0
+
+    # ① 先做“不需要网络”的过滤：市值门槛 + 非金融
+    pre: List[Tuple[str, str, float]] = []
     for code, name, cap in enriched:
         if cond.get("min_market_cap") is not None and cap < float(cond["min_market_cap"]):
             continue
@@ -294,9 +439,45 @@ def build_candidate_pool(cond: Dict[str, Any], universe: StockUniverse, cache: D
             ind = industry_label(get_industry(code, cache, log=None))
             if any(k in ind for k in _FINANCE_KEYS):
                 continue
-        pool.append({"code": code, "name": name, "市值(亿)": cap})
-        if len(pool) >= pool_size:
+        pre.append((code, name, cap))
+        if len(pre) >= pool_size * 6:
             break
+
+    if need_listed:
+        log(f"   正在逐只获取精确上市日期（门槛：上市 > {min_years:g} 年，串行+缓存）…")
+        t0 = time.time()
+        budget = 240.0
+        scanned = 0
+        for code, name, cap in pre:
+            if len(pool) >= pool_size:
+                break
+            if time.time() - t0 > budget:
+                log(f"   ⚠️ 上市日期获取达时间预算 {budget:.0f}s，已扫描 {scanned} 只，"
+                    f"下次运行会用缓存继续补齐")
+                break
+            listed = fetch_listing_date(code, cache, None)
+            scanned += 1
+            yrs = listing_years(listed) if listed else None
+            if yrs is None:
+                _unknown.append(code)
+                continue
+            if yrs <= min_years:
+                continue
+            pool.append({"code": code, "name": name, "市值(亿)": cap,
+                         "上市日期": listed, "上市年数": yrs})
+    else:
+        for code, name, cap in pre:
+            pool.append({"code": code, "name": name, "市值(亿)": cap,
+                         "上市日期": None, "上市年数": None})
+            if len(pool) >= pool_size:
+                break
+
+    if need_listed:
+        if _unknown:
+            log(f"   ℹ️ 有 {len(_unknown)} 只因取不到上市日期被跳过（保守处理）")
+        if pool:
+            _sample = "、".join(f"{p['name']}({p.get('上市日期')})" for p in pool[:3])
+            log(f"   上市时间门槛已生效，样例：{_sample}")
     log(f"   候选池就绪：{len(pool)} 只（按市值降序）")
     return pool
 
@@ -309,7 +490,8 @@ def run_screening(query: str, output_root: str, cache: DiskCache,
                   log: Optional[Callable[[str], None]] = None,
                   progress: Optional[Callable[[int, int, str], None]] = None,
                   extra_codes: Optional[List[Dict[str, Any]]] = None,
-                  ds_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                  ds_cfg: Optional[Dict[str, Any]] = None,
+                  conditions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """执行海选，产出与原程序同名同结构的四张表。
 
     extra_codes: 额外强制纳入的公司（例如手工指定），[{"code","name"}]
@@ -322,7 +504,11 @@ def run_screening(query: str, output_root: str, cache: DiskCache,
         log("   数据源可用性: " + str(source_status(ds_cfg.get("tushare_token", ""))))
     except Exception:
         pass
-    cond = parse_query(query or DEFAULT_WENCAI_QUERY)
+    # 【筛选条件设置】优先用前端传来的结构化条件；没有则解析 query 文本
+    if conditions:
+        cond = normalize_conditions(conditions, fallback_query=query or DEFAULT_WENCAI_QUERY)
+    else:
+        cond = parse_query(query or DEFAULT_WENCAI_QUERY)
     log(f"🎯 海选条件：{conditions_to_text(cond) or '（未解析出任何阈值条件，仅按候选池输出）'}")
     if cond["unparsed"]:
         log(f"   ℹ️ 未能解析的条件片段（已忽略）：{cond['unparsed']}")
@@ -403,6 +589,20 @@ def run_screening(query: str, output_root: str, cache: DiskCache,
 
         fails: List[str] = []
         n = cond["years"]
+        # 上市时间：优先用**精确上市日期**（候选池阶段已取到，见 build_candidate_pool）；
+        # 没有则退回“报告期年数”近似判断。
+        if cond.get("min_listed_years") is not None:
+            # 上市日期已在候选池阶段取到并随 item 传入；仅当缺失时才回退近似判断
+            listed = item.get("上市日期")
+            yrs = listing_years(listed) if listed else None
+            rec["上市日期"] = listed
+            rec["上市年数"] = yrs
+            if yrs is None:
+                need_years = max(int(cond["min_listed_years"]) + 1, n)
+                if len(years_have) < need_years:
+                    fails.append(f"上市时间不足{cond['min_listed_years']:g}年（仅{len(years_have)}年披露记录）")
+            elif yrs <= float(cond["min_listed_years"]):
+                fails.append(f"上市时间{yrs}年≤{cond['min_listed_years']:g}年")
         if cond["min_roe"] is not None:
             if len(roe_vals) < n or min(roe_vals) < cond["min_roe"]:
                 fails.append(f"ROE未连续{n}年≥{cond['min_roe']}")
@@ -412,6 +612,22 @@ def run_screening(query: str, output_root: str, cache: DiskCache,
         if cond["min_cash_content"] is not None:
             if len(cc_vals) < n or min(cc_vals) < cond["min_cash_content"]:
                 fails.append(f"现金含量未连续{n}年≥{cond['min_cash_content']}")
+        # 市盈率(TTM)：启用时按现价/PE 取一次（取不到则视为不通过，避免误选）
+        if cond.get("max_pe") is not None:
+            pe = None
+            try:
+                from .valuation import fetch_price_pe, quote_symbol
+                sym, _mkt = quote_symbol(code, cache=cache)
+                if sym:
+                    q = fetch_price_pe(sym, log=None)
+                    pe = q.get("PE_TTM") if q else None
+            except Exception:
+                pe = None
+            rec["市盈率TTM"] = pe
+            if pe is None:
+                fails.append("未取到市盈率")
+            elif float(pe) >= float(cond["max_pe"]):
+                fails.append(f"市盈率{pe}≥{cond['max_pe']}")
 
         rec["ROE最低"] = min(roe_vals) if roe_vals else None
         rec["毛利率最低"] = min(gm_vals) if gm_vals else None

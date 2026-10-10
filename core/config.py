@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 # ======================================================================
 # 一、造假排雷（原 FraudDetectionApp.params）—— 22 项阈值，键名与桌面版逐字一致
@@ -143,6 +143,78 @@ DEFAULT_AI_QUERY = (
     "roe_weighted>40%、净利润现金含量>80%，gross_profit_margin>40%，上市时间>3年，剔除北交所中的公司和金融股。"
     "如果没有符合条件的则跳过，不能擅自乱抓其他不完全符合条件的公司。"
 )
+
+# ----------------------------------------------------------------------
+# 海选条件设置（逐条可调；None / 0 表示该项不启用）
+# 前端“🎯 海选”页的【筛选条件设置】面板直接绑定这份配置。
+# ----------------------------------------------------------------------
+HAIXUAN_CONDITION_FIELDS: List[Dict[str, Any]] = [
+    # key,              中文名,                 默认值, 单位,   说明
+    {"key": "years", "name": "连续年数", "val": 5, "unit": "年", "kind": "int", "min": 1, "max": 10,
+     "help": "要求最近 N 个完整会计年度**每年**都满足下面的门槛"},
+    {"key": "min_roe", "name": "加权净资产收益率(ROE) >", "val": 20.0, "unit": "%",
+     "kind": "float", "min": 0.0, "max": 200.0,
+     "help": "取“加权净资产收益率”，缺失时回退“净资产收益率”；填 0 表示不启用该条件"},
+    {"key": "min_cash_content", "name": "净利润现金含量 >", "val": 100.0, "unit": "%",
+     "kind": "float", "min": 0.0, "max": 1000.0,
+     "help": "经营现金净流量 ÷ 净利润；>100% 表示利润有真金白银支撑"},
+    {"key": "min_gross_margin", "name": "销售毛利率 >", "val": 40.0, "unit": "%",
+     "kind": "float", "min": 0.0, "max": 100.0,
+     "help": "毛利率按利润表口径计算（营业收入−营业成本）/营业收入"},
+    {"key": "min_listed_years", "name": "上市时间 >", "val": 3.0, "unit": "年",
+     "kind": "float", "min": 0.0, "max": 30.0, "help": "剔除上市时间过短的新股；0 表示不启用"},
+    {"key": "min_market_cap", "name": "总市值 >", "val": 0.0, "unit": "亿元",
+     "kind": "float", "min": 0.0, "max": 100000.0, "help": "0 表示不限"},
+    {"key": "max_pe", "name": "市盈率(TTM) <", "val": 0.0, "unit": "倍",
+     "kind": "float", "min": 0.0, "max": 500.0, "help": "0 表示不限（需能取到 PE）"},
+    {"key": "exclude_bj", "name": "剔除北交所", "val": True, "kind": "bool"},
+    {"key": "exclude_finance", "name": "剔除金融股（银行/保险/证券等）", "val": True, "kind": "bool"},
+    {"key": "exclude_st", "name": "剔除 ST / *ST", "val": True, "kind": "bool"},
+]
+
+HAIXUAN_DEFAULT_CONDITIONS: Dict[str, Any] = {f["key"]: f["val"] for f in HAIXUAN_CONDITION_FIELDS}
+
+
+def default_haixuan_conditions() -> Dict[str, Any]:
+    """海选条件的出厂默认值（一份可安全修改的副本）。"""
+    return dict(HAIXUAN_DEFAULT_CONDITIONS)
+
+
+def conditions_to_query(c: Dict[str, Any]) -> str:
+    """把结构化条件拼成“连续N年…剔除…”的文本，便于写进日志/报告与人工核对。"""
+    c = c or {}
+    years = int(c.get("years") or 5)
+    parts: List[str] = []
+
+    def _num(k: str):
+        v = c.get(k)
+        try:
+            v = float(v)
+        except Exception:
+            return None
+        return v if v and v > 0 else None
+
+    if _num("min_roe"):
+        parts.append(f"连续{years}年加权ROE>{_num('min_roe'):g}")
+    if _num("min_cash_content"):
+        parts.append(f"连续{years}年净利润现金含量>{_num('min_cash_content'):g}")
+    if _num("min_gross_margin"):
+        parts.append(f"连续{years}年毛利率>{_num('min_gross_margin'):g}")
+    if _num("min_listed_years"):
+        parts.append(f"上市时间>{_num('min_listed_years'):g}年")
+    if _num("min_market_cap"):
+        parts.append(f"总市值>{_num('min_market_cap'):g}亿")
+    if _num("max_pe"):
+        parts.append(f"市盈率<{_num('max_pe'):g}")
+    if c.get("exclude_bj"):
+        parts.append("剔除北交所")
+    if c.get("exclude_finance"):
+        parts.append("非金融股")
+    if c.get("exclude_st"):
+        parts.append("剔除ST")
+    return "，".join(parts)
+
+
 HAIXUAN_PRESETS: Dict[str, str] = {
     "默认A股多条件": "连续5年加权roe>25，连续5年净利润现金含量>80，连续5年毛利率>40，上市时间>3年，剔除北交所，非金融股",
     "优势大市值": "连续5年加权roe>15%，剔除北交所，非金融股\n量价齐升，且市值大于100亿\n近3年净利润增长率大于20%",

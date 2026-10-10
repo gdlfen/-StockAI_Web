@@ -136,6 +136,13 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
     return {"ok": ok}
 
 
+@app.post("/api/jobs/{job_id}/pause")
+def pause_job(job_id: str, paused: bool = True) -> Dict[str, Any]:
+    """暂停 / 继续任务（协作式：在阶段内的循环检查点生效）。"""
+    ok = JOB_MANAGER.pause(job_id, paused=paused)
+    return {"ok": ok, "paused": paused}
+
+
 # ======================================================================
 # 文件接口
 # ======================================================================

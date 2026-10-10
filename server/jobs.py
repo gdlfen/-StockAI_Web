@@ -30,7 +30,7 @@ class Job:
     params: Dict[str, Any]
     data_dir: str
     cache_dir: str
-    status: str = "pending"           # pending / running / done / failed / cancelled
+    status: str = "pending"           # pending / running / paused / done / failed / cancelled
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -43,7 +43,30 @@ class Job:
     logs: Deque[str] = field(default_factory=lambda: deque(maxlen=MAX_LOG_LINES))
     result: Optional[Dict[str, Any]] = None
     error: str = ""
+    # ---- 协作式暂停 / 停止 ----
+    pause_flag: bool = False
+    stop_flag: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    # ---------- 控制 ----------
+    def checkpoint(self) -> None:
+        """在阶段内的循环里调用：暂停时阻塞等待，停止时抛出中断。
+
+        之所以做成“检查点”而不是真挂起线程：所有耗时都发生在同步网络请求里，
+        无法安全地打断；在循环边界检查是最稳、且不会破坏数据一致性的做法。
+        """
+        import time as _t
+        while self.pause_flag and not self.stop_flag:
+            _t.sleep(0.3)
+        if self.stop_flag:
+            raise KeyboardInterrupt("用户停止任务")
+
+    def set_paused(self, paused: bool) -> None:
+        self.pause_flag = bool(paused)
+        if paused and self.status == "running":
+            self.status = "paused"
+        elif not paused and self.status == "paused":
+            self.status = "running"
 
     # ---------- 读取 ----------
     def snapshot(self, log_tail: int = 200) -> Dict[str, Any]:
@@ -51,6 +74,8 @@ class Job:
             return {
                 "id": self.id,
                 "status": self.status,
+                "paused": self.pause_flag,
+                "stopping": self.stop_flag,
                 "stage_keys": list(self.stage_keys),
                 "stage_index": self.stage_index,
                 "stage_total": self.stage_total,
@@ -104,12 +129,23 @@ class JobManager:
         return [j.snapshot(log_tail=0) for j in jobs]
 
     def cancel(self, job_id: str) -> bool:
-        """软取消：置状态，正在跑的阶段会在下一次进度回调处退出。"""
+        """停止任务：置停止标志；正在跑的阶段会在下一个检查点退出。"""
         job = self.get(job_id)
         if not job or job.status in ("done", "failed", "cancelled"):
             return False
+        job.stop_flag = True
+        job.pause_flag = False          # 取消暂停以便线程能走到检查点
         job.status = "cancelled"
-        job.log("⏹️ 已请求取消任务…")
+        job.log("⏹️ 已请求停止任务，将在当前这一步完成后中断…")
+        return True
+
+    def pause(self, job_id: str, paused: bool = True) -> bool:
+        """暂停 / 继续：协作式，在阶段内的循环检查点生效。"""
+        job = self.get(job_id)
+        if not job or job.status in ("done", "failed", "cancelled"):
+            return False
+        job.set_paused(paused)
+        job.log("⏸️ 已暂停（当前这一步跑完后挂起）" if paused else "▶️ 已继续运行")
         return True
 
     # ------------------------------------------------------------------
@@ -128,16 +164,25 @@ class JobManager:
             job.log(f"🚀 任务开始：{len(job.stage_keys)} 个阶段 | 数据目录 {job.data_dir}")
 
             for idx, key in enumerate(job.stage_keys):
-                if job.status == "cancelled":
-                    job.log("⏹️ 任务已取消，停止后续阶段。")
+                # 阶段之间也响应停止；暂停则在此等待
+                try:
+                    job.checkpoint()
+                except KeyboardInterrupt:
+                    job.log("⏹️ 任务已停止。")
+                    job.finished_at = time.time()
+                    return
+                if job.stop_flag:
+                    job.log("⏹️ 任务已停止，放弃后续阶段。")
                     job.finished_at = time.time()
                     return
                 job.stage_index = idx + 1
                 job.stage_name = next((s["name"] for s in pipe.STAGES if s["key"] == key), key)
                 job.set_step(0, 0, "")
 
-                def _progress(done: int, total: int, label: str = "") -> None:
-                    job.set_step(done, total, label)
+                # 进度回调同时充当“协作式检查点”：阶段内的循环只要有进度就会响应暂停/停止
+                def _progress(done: int, total: int, label: str = "", _job=job) -> None:
+                    _job.set_step(done, total, label)
+                    _job.checkpoint()
 
                 ctx = pipe.make_context(job.data_dir, job.cache_dir, user_config=cfg,
                                         log=make_logger(job.log), progress=_progress)
@@ -150,6 +195,12 @@ class JobManager:
                 stage_params.setdefault("_job", job.id)
                 try:
                     res = fn(ctx, stage_params)
+                except KeyboardInterrupt:
+                    # 用户在阶段内的检查点按了“停止”
+                    job.log("⏹️ 任务已被用户停止（当前阶段中断，已生成的产物会保留）。")
+                    job.status = "cancelled"
+                    job.finished_at = time.time()
+                    return
                 except Exception as e:  # noqa: BLE001
                     import traceback
                     job.log(f"❌ 阶段【{job.stage_name}】失败：{type(e).__name__}: {e}")
