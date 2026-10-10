@@ -128,6 +128,20 @@ with st.sidebar:
         st.caption("后端启动：`uvicorn server.main:app --host 0.0.0.0 --port 8000`")
 
     st.divider()
+    # 数据源可用性：让“某个可选依赖没装上”这种情况一眼可见，
+    # 而不是等到跑某个模块才发现数据为空。
+    try:
+        from core.datasource import source_status
+        _ds = source_status((st.session_state.get("user_config") or {}).get("data_source", {}).get("tushare_token", ""))
+        _marks = {"akshare": "AkShare(主)", "baostock": "Baostock(备)", "tushare": "TuShare(备)"}
+        _txt = " · ".join(f"{'✅' if ok else '⬜'} {_marks.get(k, k)}" for k, ok in _ds.items())
+        st.caption("数据源：" + _txt)
+        if not _ds.get("akshare"):
+            st.warning("未检测到 AkShare（主数据源）。年报汇总与海选将无法工作，"
+                       "请确认 requirements.txt 已包含 `akshare` 并重新部署。")
+    except Exception:
+        pass
+
     st.metric("数据目录", os.path.basename(_session_dir()))
     if st.button("🧹 清空本次会话数据", use_container_width=True):
         shutil.rmtree(_session_dir(), ignore_errors=True)

@@ -103,8 +103,26 @@ streamlit run webapp/app.py                            # 前端，侧边栏切�
 > 现在这种情况不会再抛裸异常，而是显示一个**中文诊断页**，列出它查找过的每个目录及其内容，
 > 便于一眼看出缺了什么。
 
+### 部署报错排查（按报错原文对照）
+
+| Cloud 上的报错 | 原因 | 处理 |
+|---|---|---|
+| `You do not have access to this app or it does not exist` | 不是代码问题。①应用在你的个人工作区，需用**应用所属账号**登录后访问；②网址不对（务必用 share.streamlit.io 应用页显示的 URL）；③还没部署成功 | 登录 share.streamlit.io → My apps → 进入应用；再在 Manage app → Settings 里把 Viewer access 设为公开，手机即可免登录打开 |
+| `ModuleNotFoundError: No module named 'core'` | 仓库里缺 `core/` 文件夹 | 上传 `core/`（13 个 .py）；入口已内置中文诊断页，会列出缺失项 |
+| `❗️ installer returned a non-zero exit code` + `Error during processing dependencies!` | **`packages.txt` 里有不存在的 apt 包名**，导致 apt 整体失败（Python 依赖本身没问题也会失败） | 本仓库已修正：移除了 Debian 不存在的 `libxslt1-dev`，只保留 `build-essential / python3-dev / zlib1g-dev` |
+| pip 解析或安装某个包失败 | 可选依赖（`duckduckgo-search`、`ddgs`、`tushare`）会拉入 `primp` 等编译型/大体积依赖 | 本仓库已把可选依赖移到 `requirements-extras.txt`，默认不装；需要时再复制到 `requirements.txt` |
+
+**依赖分层说明**
+
+- `requirements.txt`：**核心必需**，已全部加版本上限（`streamlit>=1.36,<2`、`pandas>=2.2,<3`、
+  `numpy>=1.26,<3`、`akshare>=1.14`、`openai>=1.30,<2` 等）。其中 `openai` 必须锁在 **1.x**：
+  2.x/3.x 改用 `httpx`/`httpx2` 客户端，容易与 Streamlit 的 httpx 生态冲突。
+- `requirements-extras.txt`：**可选增强**（baostock / tushare / duckduckgo-search / ddgs）。
+  缺失时代码自动降级：没有 baostock/tushare 就只用 AkShare；没有 ddgs 就跳过联网检索。
+  前端侧边栏会显示 **数据源可用性**（`✅ AkShare(主) · ⬜ Baostock(备) · ⬜ TuShare(备)`）。
+
 > 部署注意事项
-> - Python 版本建议 **3.11 / 3.12**（`packages.txt` 已声明 `build-essential` 等系统依赖）。
+> - Python 版本建议 **3.11 / 3.12**。
 > - 云端磁盘**重启后会清空**：所有产物请用「📦 产物」页的 **打包下载 zip** 及时保存。
 > - 免费额度下 CPU/内存有限，建议把「海选候选池大小」控制在 100~300。
 > - 若只跑前端，可从 `requirements.txt` 注释掉 `fastapi/uvicorn` 以加快安装。

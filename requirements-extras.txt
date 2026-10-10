@@ -1,0 +1,17 @@
+# 可选增强依赖（默认**不安装**）
+#
+# 用法：如果要用到这些数据源，把下面需要的行复制到 requirements.txt 后再推送。
+# 全部缺失时程序会自动降级，不会报错：
+#   - 没有 baostock / tushare → core/datasource.py 自动跳过，只用 AkShare
+#   - 没有 duckduckgo-search / ddgs → 企业AI深度分析跳过联网检索，仅用本地表格资料
+#
+# 之所以默认不装：它们会额外拉入 primp / websocket-client 等编译型或体积较大的依赖，
+# 在 Streamlit Community Cloud 的免费额度下会明显拖慢甚至拖垮依赖安装。
+
+# ---- 备用行情/财务数据源（多源容错用，缺失自动跳过）----
+# baostock>=0.8.9            # 纯 Python，体积小，建议保留
+# tushare>=1.4.6             # 需要在“设置”里填 token 才会启用
+
+# ---- 企业AI深度分析里的“全网检索情报”（缺失则只用本地表格资料）----
+# duckduckgo-search>=6.1,<9
+# ddgs>=9.0 ; python_version >= "3.12"

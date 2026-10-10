@@ -1,8 +1,16 @@
 # Streamlit Community Cloud 的系统依赖（apt 包）
-# 说明：只需保证 lxml / pandas / akshare 的轮子或编译可用。
-# 官方基础镜像已带 Python 开发头文件，这里不要写 python3-dev（Debian 包名为 python3-dev 但
-# 云端镜像偶尔解析失败，会导致部署直接报错）。
+#
+# ⚠️ 重要：这里的包名必须全部正确，**任何一个名字不存在都会让 apt 安装整体失败**，
+#    报错表现为 “❗️ installer returned a non-zero exit code / Error during processing
+#    dependencies!”，即使 Python 依赖本身没问题也会部署失败。
+#
+# 之前误写了 `libxslt1-dev`（那是 Ubuntu 的包名，Debian 里不存在），已移除。
+# 这里只保留最小且确定存在的编译基础件：
+#   - build-essential : gcc/g++/make，少数只有 sdist 的依赖（如 jsonpath）需要它
+#   - python3-dev     : Python 头文件，编译 C 扩展时必需
+#   - zlib1g-dev      : zlib 头文件
+#
+# 说明：lxml / numpy / pandas / curl_cffi 都已经有 Linux 预编译 wheel，无需 libxml2/libxslt 开发包。
 build-essential
-libxml2-dev
-libxslt1-dev
+python3-dev
 zlib1g-dev
