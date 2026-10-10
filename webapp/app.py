@@ -630,7 +630,7 @@ def render_files() -> None:
 # ======================================================================
 # 页面
 # ======================================================================
-st.title("📈 价值投资智能分析模型 · 云端版（田夫开发）")
+st.title("📈 价值投资智能分析模型 · 云端版")
 tabs = st.tabs(["🏠 总览", "🎯 海选", "📚 年报数据", "🕵️ 造假排雷",
                 "📊 16维度", "🤖 企业AI", "💰 好价估值", "⚙️ 设置", "📦 产物"])
 
@@ -906,12 +906,25 @@ with tabs[5]:
     st.caption("把本项目汇总的财务表格 + 联网检索情报喂给 LLM，逐家生成企业深度报告。"
                "需要在「设置」里填 API Key。")
     cfg = _cfg()
-    ai = cfg.get("ai") or {}
-    st.caption(f"当前模型：`{ai.get('model','-')}` · 接口：`{ai.get('base_url','-')}` · "
-               f"Key：{'已配置' if (ai.get('api_key') or '').strip() else '未配置'}")
+    ai = dict(cfg.get("ai") or {})
+    _k = str(ai.get("api_key") or "").strip()
+    if _k:
+        st.success(f"AI 已就绪：Key {_k[:6]}…{_k[-4:]} · 模型 `{ai.get('model','-')}` · "
+                   f"接口 `{ai.get('base_url','-')}`")
+    else:
+        st.error("尚未配置 AI Key：请到「⚙️ 设置 → AI 接口」填入 DeepSeek Key。"
+                 "（该页输入即时生效，无需再点保存）")
     tmpl = st.text_area("提示词模板（{company} / {competitors} / {web_info} / {doc_info} 占位符）",
                         value=ai.get("template") or cfg_mod.DEFAULT_ENTERPRISE_PROMPT, height=160)
-    if st.button("开始生成", type="primary", use_container_width=True):
+    _c1, _c2 = st.columns([1, 1])
+    with _c1:
+        _run_ai = st.button("开始生成", type="primary", use_container_width=True,
+                            disabled=not bool(_k))
+    with _c2:
+        _only_ai = st.checkbox("只跑企业AI（补跑，用已有年报数据）", value=False,
+                               help="前置阶段已跑过时，勾选可跳过其他阶段直接补生成报告")
+    if _run_ai:
+        # 每次都把当前设置一并传入，避免“配置改了但任务用的是旧值”
         start_job(["enterprise"], {"enterprise": {"template": tmpl, "ai": ai}})
     snap = render_job_progress()
     if snap and snap.get("result"):
@@ -972,15 +985,63 @@ with tabs[7]:
 
     with sub[0]:
         ai = dict(cfg.get("ai") or {})
-        ai["base_url"] = st.text_input("API 地址", value=ai.get("base_url", cfg_mod.AI_DEFAULTS["base_url"]))
-        ai["api_key"] = st.text_input("API Key", value=ai.get("api_key", ""), type="password")
-        ai["model"] = st.text_input("模型", value=ai.get("model", cfg_mod.AI_DEFAULTS["model"]))
-        ai["temperature"] = st.slider("temperature", 0.0, 1.0, float(ai.get("temperature", 0.3)), 0.05)
-        if st.button("保存 AI 设置", use_container_width=True):
+        # 关键：控件带 key，Input 变化后**直接写回 cfg**。
+        # 旧实现只在点“保存 AI 设置”时才写 cfg —— 用户填完 Key 直接去跑一键流程，
+        # 文本框里的值从未进入配置，于是企业AI 报“未配置 api_key”。这里把这一步自动化。
+        ai["base_url"] = st.text_input("API 地址", value=ai.get("base_url", cfg_mod.AI_DEFAULTS["base_url"]),
+                                       key="ai_base_url")
+        ai["api_key"] = st.text_input("API Key", value=ai.get("api_key", ""), type="password",
+                                      key="ai_api_key",
+                                      help="DeepSeek 的 Key 形如 sk-xxxx；填入后本页会立即生效，无需另外保存")
+        ai["model"] = st.text_input("模型", value=ai.get("model", cfg_mod.AI_DEFAULTS["model"]),
+                                    key="ai_model")
+        ai["temperature"] = st.slider("temperature", 0.0, 1.0,
+                                      float(ai.get("temperature", 0.3)), 0.05, key="ai_temp")
+        ai["web_search"] = st.checkbox("启用联网检索情报（360 搜索，无需额外 Key）",
+                                       value=bool(ai.get("web_search", True)), key="ai_web")
+
+        _has_key = bool((ai.get("api_key") or "").strip())
+        # 自动落盘：只要值有变化就写配置，避免“以为保存了其实没有”
+        if cfg.get("ai") != ai:
             cfg["ai"] = ai
-            cfg_mod.save_user_config(_session_dir(), cfg)
-            st.session_state.user_config = cfg
-            st.success("已保存")
+            try:
+                cfg_mod.save_user_config(_session_dir(), cfg)
+                st.session_state.user_config = cfg
+            except Exception as _e:  # noqa: BLE001
+                st.warning(f"配置保存失败（本次会话内仍有效）：{_e}")
+
+        if _has_key:
+            _k = str(ai["api_key"]).strip()
+            st.success(f"✅ AI Key 已配置（{_k[:6]}…{_k[-4:]}，共 {len(_k)} 位）"
+                       f"· 模型 `{ai.get('model')}` → 已可运行「🤖 企业AI」页")
+        else:
+            st.error("❌ 尚未配置 AI Key —— 企业AI深度分析会被跳过。"
+                     "请在「API Key」填入 DeepSeek Key（形如 sk-xxxx）。")
+        st.caption("💡 本页的输入会**立即生效**并自动保存，无需再点保存按钮。")
+
+        c_save, c_test = st.columns(2)
+        with c_save:
+            if st.button("💾 保存 AI 设置", use_container_width=True):
+                cfg["ai"] = ai
+                cfg_mod.save_user_config(_session_dir(), cfg)
+                st.session_state.user_config = cfg
+                st.success("已保存")
+        with c_test:
+            if st.button("🔌 测试连接", use_container_width=True):
+                if not _has_key:
+                    st.error("请先填入 API Key")
+                else:
+                    try:
+                        from openai import OpenAI as _OAI
+                        _cli = _OAI(api_key=ai["api_key"], base_url=ai["base_url"])
+                        _r = _cli.chat.completions.create(
+                            model=ai.get("model") or "deepseek-chat",
+                            messages=[{"role": "user", "content": "回复：OK"}],
+                            max_tokens=8)
+                        _c = (_r.choices[0].message.content or "").strip()
+                        st.success(f"✅ 连接成功，模型回复：{_c[:40]}")
+                    except Exception as _e:  # noqa: BLE001
+                        st.error(f"连接失败：{type(_e).__name__}: {str(_e)[:200]}")
 
     with sub[1]:
         fp = dict(cfg.get("fraud_params") or cfg_mod.default_fraud_params())

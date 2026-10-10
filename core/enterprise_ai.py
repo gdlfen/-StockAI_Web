@@ -100,12 +100,19 @@ _SKIP_ROW_KEYS = ("项目", "科目", "报表日期", "单位", "合计项", "�
 def _logger(log: Optional[Callable[[str], None]]) -> Callable[[str], None]:
     """统一日志出口：既打到 stdout（云端日志可见）又回调给上层（如任务队列）。
 
-    自带去重：同一秒内完全相同的消息只发一次，避免上层回调再次经过
-    common.make_logger 时出现 "[hh:mm:ss] [hh:mm:ss] xxx" 的双前缀。
+    **幂等包装**：``run_all`` 会把自己包装后的 logger 再传给 ``scan_company_tasks``、
+    ``collect_local_material`` 等函数，而它们内部又调用 ``_logger`` —— 层层嵌套后
+    同一条消息会被打印 2~6 次（实测日志里出现 ``[22:44:59] [22:44:59] [22:44:59] xxx``）。
+    因此这里给包装函数打上标记，已是包装过的直接返回，保证整条链路只打印一次。
+
+    另外保留同秒去重，防止上层 ``common.make_logger`` 再加一层前缀。
     """
     mk = getattr(common, "make_logger", None)
     if not callable(mk):
         return log or (lambda _m: None)
+    # 已包装过 → 直接复用，避免嵌套重复输出
+    if getattr(log, "_ea_logger_wrapped", False):
+        return log
     inner = mk(log)
     state: Dict[str, Any] = {"last": None, "at": 0.0}
 
@@ -118,6 +125,10 @@ def _logger(log: Optional[Callable[[str], None]]) -> Callable[[str], None]:
         state["at"] = now
         inner(text)
 
+    try:
+        _once._ea_logger_wrapped = True      # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
     return _once
 
 

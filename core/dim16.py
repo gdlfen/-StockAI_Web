@@ -1160,16 +1160,15 @@ def run_all(input_dir: str, output_dir: str, cfg: Dict[str, Any],
         total = len(all_data)
         generated_count = 0
 
-        # 明确提示“同行公司不足”：16 维度是**同行对比**，每个行业至少要有 2 家公司，
-        # 否则逐维度对比没有对手，结果为空。旧版本只打印“未提取到有效数据”，
-        # 用户无法判断是自己只跑了 1 家公司还是数据有问题。
+        # 16 维度是**同行对比**，但用户明确要求：只有 1 家公司时也要出报告。
+        # 因此这里不再拦截，只提示“同行不足”会让哪些维度失去对比意义。
         thin = {ind: len(cd) for ind, cd in all_data.items() if len(cd) < 2}
         if thin:
-            need_total = sum(1 for cd in all_data.values() if len(cd) < 2)
-            _log(f"   ⚠️ 有 {need_total} 个行业的同行公司不足 2 家，无法做同行对比："
-                 + "、".join(f"{k}({v}家)" for k, v in list(thin.items())[:8]))
-            _log("   ℹ️ 16 维度需要**同一行业内至少 2 家公司**。请在“年报数据”页多指定几家"
-                 "同行业公司（例如乳品：伊利股份 600887、东鹏饮料 605499、养元饮品 603156）。")
+            _log(f"   ℹ️ 有 {len(thin)} 个行业只有 1 家公司"
+                 + "、".join(f"{k}({v}家)" for k, v in list(thin.items())[:8])
+                 + " —— 仍会生成报告，但涉及“同行均值/排名”的维度缺少对比基准。")
+            _log("   ℹ️ 如需完整同行对比，请到「📚 年报数据」页多指定几家同行业公司"
+                 "（例如乳品饮料：伊利股份 600887、东鹏饮料 605499、养元饮品 603156）。")
 
         for idx, (industry, comp_dict) in enumerate(all_data.items(), start=1):
             if progress is not None:

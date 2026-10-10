@@ -197,8 +197,15 @@ def stage_enterprise(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, 
     ai = dict(ctx.config.get("ai") or cfg_mod.AI_DEFAULTS)
     ai.update(params.get("ai") or {})
     if not (ai.get("api_key") or "").strip():
-        ctx.log("⚠️ 未配置 AI api_key，跳过企业AI深度分析（可在“设置”里填入 DeepSeek/OpenAI Key）。")
+        ctx.log("⚠️ 未配置 AI api_key，跳过企业AI深度分析。")
+        ctx.log("   → 到「⚙️ 设置 → AI 接口」的「API Key」填入 DeepSeek Key（形如 sk-xxxx），"
+                "该页输入**即时生效**，无需另点保存；填好后回到「🤖 企业AI」页点“开始生成”即可补跑。")
+        ctx.log(f"   → 当前读取到的配置：base_url={ai.get('base_url')!r} "
+                f"model={ai.get('model')!r} api_key={'(空)' if not ai.get('api_key') else '已设置'}；"
+                f"配置文件所在目录={ctx.data_dir}")
         return {"ok": False, "skipped": True, "reason": "未配置 api_key", "reports": []}
+    ctx.log(f"   ℹ️ AI 就绪：model={ai.get('model')} base_url={ai.get('base_url')} "
+            f"key=…{str(ai.get('api_key'))[-4:]}（联网检索={'开' if ai.get('web_search', True) else '关'}）")
     template = params.get("template") or ai.get("template") or cfg_mod.DEFAULT_ENTERPRISE_PROMPT
     in_dir = os.path.join(ctx.data_dir, C.DIR_EXTRACT)
     if not os.path.isdir(in_dir):
