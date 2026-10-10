@@ -765,6 +765,34 @@ def _extract_content(resp: Any) -> str:
         return ""
 
 
+def render_template(template: str, *, company: str, competitors: str,
+                    web_info: str, doc_info: str, log=None) -> str:
+    """安全渲染提示词模板。
+
+    支持的占位符：``{company}`` / ``{competitors}`` / ``{web_info}`` / ``{doc_info}``
+    （与桌面版一致；本地财报资料对应 ``{doc_info}``）。
+
+    原来直接用 ``str.format``：模板里只要出现**任何**未知占位符（例如写成
+    ``{local_material}`` 或误留 ``{`` ），就会抛 ``KeyError`` 让整份报告生成失败。
+    现在改为：已知占位符逐个替换，未知占位符原样保留并逐条告警，
+    保证「模板写错」只影响那一处文字，而不是整份报告作废。
+    """
+    log = _logger(log)
+    text = str(template or "")
+    mapping = {"company": str(company or ""), "competitors": str(competitors or ""),
+               "web_info": str(web_info or ""), "doc_info": str(doc_info or "")}
+
+    # 找出模板里所有 {name} 形式的占位符
+    found = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text))
+    unknown = sorted(found - set(mapping))
+    for key, val in mapping.items():
+        text = text.replace("{" + key + "}", val)
+    if unknown:
+        log(f"   ⚠️ 提示词模板含未知占位符 {unknown}（已原样保留，不会被替换）；"
+            f"可用占位符：company / competitors / web_info / doc_info")
+    return text
+
+
 def analyze_company(company: str, peers: List[str], local_material: str,
                     template: str, ai_cfg: Dict[str, Any],
                     log: Optional[Callable[[str], None]] = None) -> str:
@@ -783,9 +811,10 @@ def analyze_company(company: str, peers: List[str], local_material: str,
     web_info = _build_web_info(company, competitor_text, ai_cfg, log)
 
     tpl = str(template or "").strip() or DEFAULT_TEMPLATE
-    prompt = tpl.format(company=company, competitors=competitor_text,
-                        web_info=web_info[:WEB_INFO_LIMIT],
-                        doc_info=str(local_material or "")[:DOC_INFO_LIMIT])
+    prompt = render_template(tpl, company=company, competitors=competitor_text,
+                             web_info=web_info[:WEB_INFO_LIMIT],
+                             doc_info=str(local_material or "")[:DOC_INFO_LIMIT],
+                             log=log)
 
     try:
         from openai import OpenAI  # type: ignore
@@ -850,14 +879,22 @@ def _write_docx(content: str, save_path: str, title_line: str, subtitle: str) ->
 
 
 def save_report(content: str, company: str, output_dir: str) -> str:
-    """保存为 docx，命名与桌面版一致：{company}_深度报告_{HHMM}.docx。"""
+    """保存为 docx，命名与桌面版一致：``{company}_深度报告_{HHMM}.docx``。
+
+    桌面版直接用 ``%H%M``，**同一分钟内跑两家公司就会互相覆盖**（后写的把先写的盖掉，
+    而且日志都显示"已生成"，用户不易察觉）。这里保持同样的命名风格，
+    但一旦重名就依次退避到 ``%H%M%S`` → ``_2`` → ``_3``…，确保绝不静默覆盖。
+    """
     _ensure_dir(output_dir)
     clean = _safe_filename(company) or "未命名公司"
-    name = f"{clean}_深度报告_{datetime.now().strftime('%H%M')}.docx"
-    save_path = os.path.join(output_dir, name)
-    if os.path.exists(save_path):   # 同一分钟内重复运行时避免相互覆盖（桌面版行为之上的一层保护）
-        save_path = os.path.join(
-            output_dir, f"{clean}_深度报告_{datetime.now().strftime('%H%M%S')}.docx")
+    base = f"{clean}_深度报告_{datetime.now().strftime('%H%M')}"
+    save_path = os.path.join(output_dir, f"{base}.docx")
+    if os.path.exists(save_path):
+        save_path = os.path.join(output_dir, f"{clean}_深度报告_{datetime.now().strftime('%H%M%S')}.docx")
+    n = 2
+    while os.path.exists(save_path):
+        save_path = os.path.join(output_dir, f"{base}_{n}.docx")
+        n += 1
     subtitle = f"对标: 暂无 | 时间: {datetime.now().strftime('%Y-%m-%d')}"
     return _write_docx(content, save_path, f"{clean} 深度分析报告", subtitle)
 
@@ -900,13 +937,137 @@ def _is_company_like(folder_name: str) -> bool:
     return False
 
 
+# 公司文件名形如：东鹏饮料（605499）2023年度年报提取表.xlsx / 统一整合输出_东鹏饮料(605499)_2021-2025.xlsx
+_COMPANY_FILE_RES = (
+    re.compile(r"[（(](\d{6})[)）]"),
+    re.compile(r"^\s*(\d{6})[_\-]"),
+)
+
+
+def _company_from_filename(fname: str) -> Optional[Tuple[str, str]]:
+    """从文件名解析 ``(代码, 简称)``；解析不到返回 None。"""
+    base = os.path.splitext(str(fname))[0]
+    for rx in _COMPANY_FILE_RES:
+        m = rx.search(base)
+        if not m:
+            continue
+        code = m.group(1)
+        # 简称：取代码之前、去掉“统一整合输出_”等前缀的那一段
+        head = base[:m.start()].strip(" _-")
+        head = re.sub(r"^(统一整合输出|年报提取表|合并|提取)\s*[_\-]*", "", head).strip(" _-")
+        return code, (head or code)
+    return None
+
+
+def scan_flat_tasks(input_dir: str, log=None) -> List[Dict[str, Any]]:
+    """兼容本项目**实际产出结构**的任务扫描。
+
+    本项目《报表提取完善》下的布局是「按行业一个文件夹、公司文件平铺在里面」：
+        {输入根}/{简称}_行业_{行业}/{简称}（{代码}）{年}年度年报提取表.xlsx
+        {输入根}/{简称}_行业_{行业}/统一整合输出_{简称}({代码})_{起}-{止}.xlsx
+    并没有 ``{代码}_{简称}`` 子目录 —— 所以 ``scan_company_tasks`` 会一条都扫不到。
+    这里按**文件名**识别公司，并以同行业文件夹内的其它公司作为同行。
+    """
+    log = _logger(log)
+    tasks: List[Dict[str, Any]] = []
+    if not input_dir or not os.path.isdir(input_dir):
+        return tasks
+
+    def _scan_dir(dir_path: str, group: str) -> None:
+        try:
+            names = sorted(os.listdir(dir_path))
+        except Exception:  # noqa: BLE001
+            return
+        # 每个代码 -> 该公司的文件路径列表
+        per: Dict[str, Dict[str, Any]] = {}
+        for f in names:
+            fp = os.path.join(dir_path, f)
+            if not os.path.isfile(fp):
+                continue
+            if any(k and k in f for k in SKIP_DIR_KEYS):
+                continue
+            if not f.lower().endswith((".xlsx", ".xls", ".csv", ".docx", ".doc", ".pdf")):
+                continue
+            got = _company_from_filename(f)
+            if not got:
+                continue
+            code, name = got
+            rec = per.setdefault(code, {"code": code, "name": name, "files": []})
+            rec["files"].append(fp)
+            # 简称优先取“统一整合输出”/“年报提取表”文件名里的那一段（更可靠）
+            if name and (rec["name"] == code or len(name) > len(rec["name"])):
+                rec["name"] = name
+
+        if not per:
+            return
+        # 只保留有可用资料的（统一整合输出或年报提取表）
+        usable = {}
+        for code, rec in per.items():
+            if any(("统一整合输出" in os.path.basename(p)) or ("年报提取表" in os.path.basename(p))
+                   for p in rec["files"]):
+                usable[code] = rec
+        if not usable:
+            return
+        for code, rec in usable.items():
+            peers = [f"{c}_{r['name']}" for c, r in usable.items() if c != code]
+            tasks.append({
+                "path": dir_path,                 # 文件平铺在行业目录里
+                "name": f"{code}_{rec['name']}",  # 与结构 A/B 一致的命名
+                "code": code,
+                "display_name": rec["name"],
+                "group": group,
+                "files": rec["files"],
+                "peers": peers,
+                "peers_text": "、".join(_clean_name(p) for p in peers) or "暂无",
+            })
+
+    top_dirs = _list_dirs(input_dir)
+    # 顶层若直接就是公司文件（无行业目录），也支持
+    _scan_dir(input_dir, "")
+    for group in top_dirs:
+        if any(k and k in group for k in SKIP_DIR_KEYS):
+            continue
+        _scan_dir(os.path.join(input_dir, group), group)
+
+    if tasks:
+        log(f"   ℹ️ 按「行业目录 + 公司文件平铺」结构识别到 {len(tasks)} 家公司"
+            f"（行业组 {len({t['group'] for t in tasks})} 个）")
+    return tasks
+
+
+def _peer_names_from_table(company_dir: str, display_name: str) -> List[str]:
+    """从《2_{简称}_同行排列表.xlsx》读取同行名称（本项目产出里就有）。"""
+    try:
+        for f in _list_files(company_dir):
+            if "同行排列表" not in f:
+                continue
+            df = pd.read_excel(os.path.join(company_dir, f))
+            if "名称" not in df.columns:
+                continue
+            out: List[str] = []
+            for _, r in df.iterrows():
+                nm = str(r.get("名称") or "").strip()
+                cd = str(r.get("代码") or "").strip()
+                if not nm:
+                    continue
+                if nm == display_name or cd in f:
+                    continue          # 排除代表公司自己
+                out.append(f"{cd}_{nm}" if cd else nm)
+            if out:
+                return out
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
 def scan_company_tasks(input_dir: str, log: Optional[Callable[[str], None]] = None
                        ) -> List[Dict[str, Any]]:
     """扫描输入根目录，返回 [{"path","name","peers","peers_text","group"}]。
 
-    兼容两种结构：
+    兼容三种结构：
       A) {输入根}/{行业文件夹}/{代码}_{简称}/      （本项目标准结构，同行=同行业其余公司）
       B) {输入根}/{代码}_{简称}/                   （扁平结构，同行=其余公司）
+      C) {输入根}/{行业文件夹}/ 公司文件平铺/**    （本项目**实际产出**结构，按文件名识别公司）
     """
     log = _logger(log)
     tasks: List[Dict[str, Any]] = []
@@ -953,8 +1114,18 @@ def scan_company_tasks(input_dir: str, log: Optional[Callable[[str], None]] = No
             if folders:
                 _collect(group, folders)
 
+    # 结构 C 兜底：以上都没扫到 → 按文件名识别（本项目实际产出结构）
     if not tasks:
-        log("⚠️ 未扫描到任何 {代码}_{简称} 形式的公司目录（可尝试 company_filter 或检查目录结构）")
+        tasks = scan_flat_tasks(input_dir, log)
+        # 用《同行排列表》里的真实同行覆盖“同目录其余公司”
+        for t in tasks:
+            real = _peer_names_from_table(t.get("path", ""), t.get("display_name", ""))
+            if real:
+                t["peers"] = real
+                t["peers_text"] = "、".join(_clean_name(p) for p in real)
+
+    if not tasks:
+        log("⚠️ 未扫描到任何公司资料（可尝试 company_filter 或检查目录结构）")
     return tasks
 
 

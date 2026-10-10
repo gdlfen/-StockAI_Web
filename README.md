@@ -109,8 +109,11 @@ streamlit run webapp/app.py                            # 前端，侧边栏切�
 |---|---|---|
 | `You do not have access to this app or it does not exist` | 不是代码问题。①应用在你的个人工作区，需用**应用所属账号**登录后访问；②网址不对（务必用 share.streamlit.io 应用页显示的 URL）；③还没部署成功 | 登录 share.streamlit.io → My apps → 进入应用；再在 Manage app → Settings 里把 Viewer access 设为公开，手机即可免登录打开 |
 | `ModuleNotFoundError: No module named 'core'` | 仓库里缺 `core/` 文件夹 | 上传 `core/`（13 个 .py）；入口已内置中文诊断页，会列出缺失项 |
-| `❗️ installer returned a non-zero exit code` + `Error during processing dependencies!` | **`packages.txt` 里有不存在的 apt 包名**，导致 apt 整体失败（Python 依赖本身没问题也会失败） | 本仓库已修正：移除了 Debian 不存在的 `libxslt1-dev`，只保留 `build-essential / python3-dev / zlib1g-dev` |
+| `❗️ installer returned a non-zero exit code` + `Error during processing dependencies!` | **`packages.txt` 里的注释行/空行被 apt 当成参数**（也含不存在的包名），导致 apt 整体失败 | `packages.txt` **只能写包名**，不能有注释、空行、说明文字。本仓库已是纯三行包名 |
+| 页面报 `NameError` / 变量未定义 | 例如 `if detail:` 但赋值行缺失 | 已修；并新增「结果分支」测试覆盖各模块的结果渲染路径 |
 | pip 解析或安装某个包失败 | 可选依赖（`duckduckgo-search`、`ddgs`、`tushare`）会拉入 `primp` 等编译型/大体积依赖 | 本仓库已把可选依赖移到 `requirements-extras.txt`，默认不装；需要时再复制到 `requirements.txt` |
+| 企业AI 提示 `未扫描到任何 公司目录` | 旧版只认 `{代码}_{简称}` 目录，而本项目实际是「行业目录 + 公司文件平铺」 | 已修：`scan_company_tasks` 增加结构 C（按文件名识别公司），同行取自同目录其余公司或《同行排列表》 |
+| 企业AI 提示 `KeyError: 'local_material'` | 提示词模板占位符写错（本地财报资料对应 **`{doc_info}`**） | 已修：改为安全渲染，未知占位符原样保留并告警，**不再让整份报告失败** |
 
 **依赖分层说明**
 
