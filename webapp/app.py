@@ -106,7 +106,7 @@ st.markdown(
       h3, .stMarkdown h3 { font-size: 1.06rem !important; }
       /* Streamlit 自带的超大标题 */
       [data-testid="stHeading"] h1, [data-testid="stHeadingWithActionElements"] h1 {
-                           font-size: 1.35rem !important; }
+                           font-size: 1.06rem !important; }
       [data-testid="stHeading"] h2 { font-size: 1.18rem !important; }
       /* 手机端进一步收紧内边距 */
       @media (max-width: 640px) {
