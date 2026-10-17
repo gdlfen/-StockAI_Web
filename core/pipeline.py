@@ -99,39 +99,95 @@ def stage_report(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]
             targets = [{"code": str(r.get("代码", "")).zfill(6), "name": str(r.get("名称", "")),
                         "属性": C.TARGET_ATTR_PRIMARY} for _, r in df.iterrows()]
             ctx.log(f"   已从《{C.HAIXUAN_SUMMARY}》读取 {len(targets)} 家目标公司")
+    # 注：这里**不立即报错** —— 用户可能只填了名称（如“兴业银行”）还没解析出代码，
+    # 交给下面的“代码 ⇄ 名称”解析后统一判断，报错信息才更有指导性。
     if not targets:
-        raise RuntimeError("没有目标公司：请先跑“海选公司”，或手工指定公司列表。")
+        ctx.log("   ℹ️ 未收到目标公司，且没有海选结果可读取，将继续尝试解析用户输入…")
 
-    # 【代码 → 名称】补全：用户只填代码时（如“600887”），原逻辑会把代码当名称用，
-    # 于是出现 “600887（600887）/ 600887_600887_深度排雷报告” 这类结果，
-    # 下游的行业/同行/估值文件名也跟着错。这里统一用全市场清单补出真实简称。
+    # 【代码 ⇄ 名称】双向补全。
+    # - 只填代码（“600887”）时补出简称，避免出现 “600887（600887）”/“600887_600887_…”；
+    # - 只填名称（“兴业银行”）时**反查代码** —— 旧逻辑会把它当成空代码直接丢弃，
+    #   导致“没有目标公司”的报错。
     code2name: Dict[str, str] = {}
+    name2code: Dict[str, str] = {}
     try:
         from .universe import StockUniverse
         u = StockUniverse(ctx.cache)
         _udf = u.load()
         if _udf is not None and not _udf.empty and "code" in _udf.columns:
-            code2name = {str(c).zfill(6): str(n).strip()
-                         for c, n in zip(_udf["code"], _udf["name"])}
+            for _c, _n in zip(_udf["code"], _udf["name"]):
+                _cc, _nn = str(_c).zfill(6), str(_n).strip()
+                if _cc:
+                    code2name[_cc] = _nn
+                    if _nn:
+                        name2code.setdefault(_nn, _cc)
+                        # 去掉名称里的空格/全角字符后再登记一份（“万  科Ａ”这类）
+                        _compact = re.sub(r"\s+", "", _nn)
+                        if _compact and _compact != _nn:
+                            name2code.setdefault(_compact, _cc)
     except Exception as e:  # noqa: BLE001
-        ctx.log(f"   ⚠️ 代码→名称 映射表获取失败（不影响提取，仅影响文件名显示）：{type(e).__name__}")
+        ctx.log(f"   ⚠️ 代码/名称 映射表获取失败（不影响提取，仅影响文件名显示）：{type(e).__name__}")
+
+    def _resolve_code(raw: str) -> str:
+        """把用户输入解析成 6 位代码：支持 600887 / 600887.SH / sh600887 / 兴业银行 / 兴业银行(601166)。"""
+        s = str(raw or "").strip()
+        if not s:
+            return ""
+        m = re.search(r"(\d{6})", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"(?<!\d)(\d{5,6})(?!\d)", s)
+        if m:
+            return m.group(1).zfill(6)
+        key = re.sub(r"\s+", "", s)
+        if key in name2code:
+            return name2code[key]
+        # 模糊匹配：用户可能只写了简称的一部分
+        for nm, cd in name2code.items():
+            if nm and (nm in key or key in nm) and len(key) >= 2:
+                return cd
+        return ""
 
     fixed: List[Dict[str, Any]] = []
-    filled = 0
+    filled_name = filled_code = 0
+    unresolved: List[str] = []
     for t in targets:
-        code = str(t.get("code") or "").strip()
-        m = re.search(r"\d{6}", code)
-        code = m.group(0) if m else code.zfill(6)
+        raw_code = str(t.get("code") or "").strip()
         name = str(t.get("name") or "").strip()
-        # 名称为空、或名称本身就是那串代码 → 用清单里的简称替换
-        if code in code2name and (not name or name == code or name.lstrip("0") == code.lstrip("0")
-                                  or name in (code + ".0",) or not re.search(r"\D", name)):
+        code = _resolve_code(raw_code) or _resolve_code(name)
+        if not code:
+            unresolved.append(name or raw_code or "(空)")
+            continue
+        # 原名不可用（空 / 就是那串代码）→ 用清单里的简称
+        if code in code2name and (not name or name == code or not re.search(r"\D", name)
+                                  or name in (code + ".0",)):
+            new_name = code2name[code]
+            if new_name != name:
+                filled_name += 1
+            name = new_name
+        elif not name and code in code2name:
             name = code2name[code]
-            filled += 1
+            filled_name += 1
+        if raw_code and raw_code != code:
+            filled_code += 1
         fixed.append({**t, "code": code, "name": name or code})
     targets = fixed
-    if filled:
-        ctx.log(f"   ✅ 已为 {filled} 家公司补全名称（例如 {targets[0]['code']} → {targets[0]['name']}）")
+
+    if filled_name:
+        ctx.log(f"   ✅ 已为 {filled_name} 家公司补全名称（例如 {targets[0]['code']} → {targets[0]['name']}）")
+    if filled_code:
+        ctx.log(f"   ✅ 已为 {filled_code} 家公司由名称反查到代码")
+    if unresolved:
+        ctx.log(f"   ⚠️ 以下输入无法识别为公司代码或简称，已忽略：{unresolved[:8]}")
+        ctx.log("   → 可填 6 位代码（如 601166）或股票简称（如 兴业银行）；"
+                "简称需与行情软件显示一致。")
+    if not targets:
+        raise RuntimeError(
+            "没有目标公司。请任选其一：\n"
+            "  ① 先跑「🎯 海选公司」自动生成名单；\n"
+            "  ② 在「📚 年报数据」页或「🏠 总览」页的「手工指定公司」里填写 6 位代码或股票简称"
+            "（每行一个，例如：601166 或 兴业银行）。\n"
+            + (f"  （你填写的 {unresolved} 未能识别，请检查拼写）" if unresolved else ""))
 
     start_y = params.get("start_year")
     end_y = params.get("end_year")
@@ -144,6 +200,9 @@ def stage_report(ctx: PipelineContext, params: Dict[str, Any]) -> Dict[str, Any]
         end_year=int(end_y) if end_y else None,
         log=ctx.log, progress=ctx.progress,
         include_peers=bool(params.get("include_peers", True)),
+        # 自动纳入同行前三名：默认开启（用户要求），让下游 16 维度有同行可比
+        auto_add_sector=bool(params.get("auto_add_sector", True)),
+        max_peers=int(params.get("max_peers") or ds_cfg.get("max_peers") or 3),
         ds_cfg=ds_cfg,
     )
     return res

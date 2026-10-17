@@ -675,6 +675,8 @@ def run_annual_report_search(targets: List[Dict[str, Any]], output_root: str, ca
                              log: Optional[Callable[[str], None]] = None,
                              progress: Optional[Callable[[int, int, str], None]] = None,
                              include_peers: bool = True,
+                             auto_add_sector: bool = True,
+                             max_peers: int = 3,
                              ds_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把“海选名单 / 手工输入的公司”汇总成原《报表提取完善》目录结构。
 
@@ -682,6 +684,10 @@ def run_annual_report_search(targets: List[Dict[str, Any]], output_root: str, ca
     ----
     targets: [{"code": "605499", "name": "东鹏饮料", "所属行业": "饮料乳品", "属性": "原查询公司"}, ...]
     output_root: 输出根目录（会创建 报表提取完善/ 子目录）
+    auto_add_sector: **自动把“同行前三名”也纳入处理范围**（默认开启）。
+        这样 16 维度同行对比、企业AI、好价估值才有真正的同行可比；
+        只展开一层，不会把同行的同行再拉进来。
+    max_peers: 每个主目标补充的同行家数（默认 3）。
     """
     log = log or make_logger()
     ds_cfg = ds_cfg or {}
@@ -708,14 +714,24 @@ def run_annual_report_search(targets: List[Dict[str, Any]], output_root: str, ca
     summary: List[Dict[str, Any]] = []
 
     # ① 逐家汇总（含同行）
-    total = len(targets)
-    for i, t in enumerate(targets, start=1):
+    # 【自动纳入同行前三名】
+    # 之前「同行前三」只写进《2_XXX_同行排列表》，三家同行**并没有被当作目标处理**，
+    # 于是后续 16 维度同行对比永远只有 1 家公司。现在把这些同行自动加入处理队列，
+    # 使 16 维度 / 企业AI / 好价估值 都有真正的同行可比。
+    # 注意：只展开一层（不会把同行的同行再拉进来），且已在队列里的不重复加入。
+    auto_added: List[Dict[str, Any]] = []
+    have_codes = {str(t.get("code") or "").zfill(6) for t in targets if t.get("code")}
+    i_idx = 0
+    while i_idx < len(targets):
+        t = targets[i_idx]
+        i_idx += 1
         code, name = str(t.get("code", "")).zfill(6), str(t.get("name") or "")
         if not code:
             continue
+        total = len(targets)
         if progress:
-            progress(i, total, f"{name}({code})")
-        log(f"\n📁 [{i}/{total}] 正在汇总 {name}({code}) 的年报数据 ...")
+            progress(i_idx, total, f"{name}({code})")
+        log(f"\n📁 [{i_idx}/{total}] 正在汇总 {name}({code}) 的年报数据 ...")
         ind_info = get_industry(code, cache, log)
         ind = industry_label(ind_info) or str(t.get("所属行业") or "默认行业")
         remember_industry_member(cache, code, ind)
@@ -730,9 +746,26 @@ def run_annual_report_search(targets: List[Dict[str, Any]], output_root: str, ca
             try:
                 from .universe import find_top_peers
                 universe = StockUniverse(cache, log)
-                peers = find_top_peers(code, ind, universe, cache, top_n=3, log=log)
+                peers = find_top_peers(code, ind, universe, cache, top_n=int(max_peers or 3), log=log)
             except Exception as e:  # noqa: BLE001
                 log(f"   ⚠️ 同行检索失败: {type(e).__name__}: {str(e)[:100]}")
+
+        # 【把同行前三名纳入处理范围】（只对“主目标”展开一层）
+        if auto_add_sector and peers and not t.get("_auto_peer"):
+            for p in peers:
+                pc = str(p.get("代码") or "").zfill(6)
+                pn = str(p.get("名称") or "").strip()
+                if not pc or pc in have_codes:
+                    continue
+                have_codes.add(pc)
+                item = {"code": pc, "name": pn or pc, "属性": "同行(自动纳入)",
+                        "_auto_peer": True}
+                targets.append(item)
+                auto_added.append(item)
+            if auto_added:
+                log(f"   ➕ 已自动纳入同行前三名，待处理："
+                    + "、".join(f"{p['name']}({p['code']})" for p in auto_added[-len(peers):]))
+
         self_row = {"排名": 1, "代码": code, "名称": rep_name,
                     "市值(亿)": _safe_cap(code, cache, log)}
         all_rows = [self_row] + [{"排名": i2 + 2, **p} for i2, p in enumerate(peers)]
@@ -761,7 +794,12 @@ def run_annual_report_search(targets: List[Dict[str, Any]], output_root: str, ca
             log(f"   ⚠️ {name}({code}) 统一整合输出失败: {type(e).__name__}: {str(e)[:120]}")
 
         summary.append({"code": code, "name": rep_name, "industry": ind,
+                        "auto_peer": bool(t.get("_auto_peer")),
                         "peers": [p.get("代码") for p in peers], "files": len(generated)})
+
+    if auto_added:
+        log(f"\n📌 本次共自动纳入 {len(auto_added)} 家同行公司（用于 16 维度同行对比）："
+            + "、".join(f"{p['name']}({p['code']})" for p in auto_added))
 
     # ② 写目标清单（与原程序同名，便于回溯）
     try:

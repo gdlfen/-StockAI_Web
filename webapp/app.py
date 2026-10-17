@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -106,7 +107,7 @@ st.markdown(
       h3, .stMarkdown h3 { font-size: 1.06rem !important; }
       /* Streamlit 自带的超大标题 */
       [data-testid="stHeading"] h1, [data-testid="stHeadingWithActionElements"] h1 {
-                           font-size: 1.06rem !important; }
+                           font-size: 1.35rem !important; }
       [data-testid="stHeading"] h2 { font-size: 1.18rem !important; }
       /* 手机端进一步收紧内边距 */
       @media (max-width: 640px) {
@@ -145,6 +146,61 @@ def _data_root() -> str:
         except Exception:  # noqa: BLE001
             continue
     return tempfile.mkdtemp(prefix="vim_")
+
+
+def _parse_targets(text: str) -> List[Dict[str, Any]]:
+    """把用户输入解析成目标公司列表。
+
+    每行一个；支持：
+      - 6 位代码：``601166``
+      - 带前后缀的代码：``601166.SH`` / ``sh601166`` / ``601166 兴业银行``
+      - 股票简称：``兴业银行`` / ``重庆啤酒``（代码留空，由后端反查）
+      - 简称(代码)：``兴业银行(601166)``
+      - 多个用逗号/顿号/空格分隔也行（除整行外会再按分隔符拆一次）
+    绝不丢弃“只填了名称”的条目 —— 旧逻辑要求必须有代码，导致填名称时报“没有目标公司”。
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    raw = str(text or "")
+    for sep in ("，", "、", ";", "；"):
+        raw = raw.replace(sep, "\n")
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # 一行里可能塞了多个（用空格/逗号分隔）
+        parts = [p.strip() for p in re.split(r"[\s,]+", s) if p.strip()]
+        # 形如 “601166 兴业银行” 的两段要合起来，避免被拆成两个条目
+        chunks: List[str] = []
+        i = 0
+        while i < len(parts):
+            p = parts[i]
+            if (re.fullmatch(r"\d{6}(\.\w{2})?", p) or re.fullmatch(r"(sh|sz|bj)?\d{6}", p, re.I)) \
+                    and i + 1 < len(parts) and not re.search(r"\d", parts[i + 1]):
+                chunks.append(f"{p} {parts[i + 1]}")
+                i += 2
+                continue
+            chunks.append(p)
+            i += 1
+        for ch in chunks:
+            m = re.search(r"(\d{6})", ch)
+            code = m.group(1) if m else ""
+            # 名称：去掉代码片段、交易所前缀与括号
+            name = re.sub(r"[（(]?\s*\d{6}(\.[A-Za-z]{2})?\s*[)）]?", "", ch)
+            name = re.sub(r"^\s*(sh|sz|bj)\s*", "", name, flags=re.I)
+            name = re.sub(r"\.(SH|SZ|BJ|sh|sz|bj)\b", "", name)
+            name = name.strip(" _-,，()（）")
+            # 只剩交易所代码前缀之类的无意义残留 → 视为没有名称
+            if name.lower() in ("sh", "sz", "bj", "sh.", "sz.", "bj."):
+                name = ""
+            if not name and not code:
+                continue
+            key = code or name
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"code": code, "name": name or code})
+    return out
 
 
 def _session_dir() -> str:
@@ -630,7 +686,7 @@ def render_files() -> None:
 # ======================================================================
 # 页面
 # ======================================================================
-st.title("📈 价值投资智能分析模型 · 云端版（田夫开发）")
+st.title("📈 价值投资智能分析模型 · 云端版")
 tabs = st.tabs(["🏠 总览", "🎯 海选", "📚 年报数据", "🕵️ 造假排雷",
                 "📊 16维度", "🤖 企业AI", "💰 好价估值", "⚙️ 设置", "📦 产物"])
 
@@ -638,6 +694,7 @@ tabs = st.tabs(["🏠 总览", "🎯 海选", "📚 年报数据", "🕵️ 造�
 with tabs[0]:
     st.markdown("#### 一键跑完整流水线")
     st.caption("顺序：海选公司 → 年报数据搜索汇总 → 造假排雷 → 16维度 → 企业AI深度 → 好价估值")
+    st.caption("ℹ️ 年报数据阶段会自动把每个目标的**同行前三名**也一并汇总，这样 16 维度才有真正的同行可比（详见「📚 年报数据」页高级选项）。")
     presets = {
         "全部（推荐）": ["haixuan", "report", "fraud", "dim16", "enterprise", "valuation"],
         "跳过海选（用已有名单）": ["report", "fraud", "dim16", "enterprise", "valuation"],
@@ -653,19 +710,28 @@ with tabs[0]:
             years_back = st.number_input("年报回溯年数", 2, 10, 5, 1)
         with c2:
             manual = st.text_area("手工指定公司（每行一个，可填代码或简称；留空则用海选结果）",
-                                  height=90, placeholder="600887\n605499\n重庆啤酒")
+                                  height=90, key="overview_targets_text",
+                                  placeholder="601166\n605499\n兴业银行\n重庆啤酒",
+                                  help="这里与「📚 年报数据」页的输入会**合并生效**，只填其中一处即可")
     if st.button("🚀 开始运行", type="primary", use_container_width=True):
-        targets = []
-        for line in (manual or "").replace("，", ",").splitlines():
-            s = line.strip()
-            if s:
-                targets.append({"code": s if s.isdigit() else "", "name": s})
+        # 【目标公司】把「总览」和「📚 年报数据」两处的输入合并起来 ——
+        # 旧逻辑只看总览这一个框，用户在年报数据页填了公司、但从总览点运行，
+        # 就会得到 “没有目标公司” 的报错。
+        _merged = "\n".join([
+            str(st.session_state.get("overview_targets_text") or ""),
+            str(st.session_state.get("report_targets_text") or ""),
+        ])
+        targets = _parse_targets(_merged)
         params = {
             "haixuan": {"pool_size": int(pool_size)},
-            "report": {"years_back": int(years_back),
-                       "targets": [t for t in targets if t.get("code")] or None},
+            "report": {"years_back": int(years_back), "targets": targets or None,
+                       # 自动把同行前三名也纳入处理 → 16 维度才有同行可比
+                       "auto_add_sector": True, "include_peers": True, "max_peers": 3},
             "enterprise": {},
         }
+        if not targets and pick != "只要好价估值" and not pick.startswith("全部"):
+            st.warning("没有指定目标公司：将在「年报数据」阶段尝试读取海选结果；"
+                       "若也没跑过海选，请在上面的「手工指定公司」或「📚 年报数据」页填写代码/简称。")
         start_job(presets[pick], params)
     snap = render_job_progress()
     if snap and snap.get("result"):
@@ -791,22 +857,29 @@ with tabs[2]:
     st.caption("用 AkShare（新浪财报 / 东财分红 / 同花顺）汇总三大表、分红、员工数据，"
                "产出与原《年报提取表》《统一整合输出》完全一致的表结构。")
     manual = st.text_area("目标公司（每行一个：代码或简称；留空则读海选结果）", height=110,
-                          placeholder="600887\n605499\n603156")
+                          key="report_targets_text",
+                          placeholder="601166\n兴业银行\n605499\n重庆啤酒",
+                          help="填名称也可以（会自动反查代码）；这里与「🏠 总览」页的输入合并生效")
     c1, c2 = st.columns(2)
     with c1:
         sy = st.number_input("起始年份", 2000, 2030, datetime.now().year - 4)
     with c2:
         ey = st.number_input("结束年份", 2000, 2030, datetime.now().year)
-    with st.expander("高级：当年报汇总遇到同名多文件时，行业分组与同行"):
-        inc_peers = st.checkbox("同时生成同行排列表（同行前三）", value=True)
+    with st.expander("高级：同行与行业分组", expanded=True):
+        inc_peers = st.checkbox("生成《同行排列表》", value=True,
+                                help="每家公司产出一张同行前三名对比表")
+        auto_peers = st.checkbox("自动把同行前三名也纳入处理（推荐）", value=True,
+                                 key="rp_auto_peers",
+                                 help="不止写进排列表，而是把这三家同行也完整汇总年报数据，"
+                                      "这样后续 16 维度才能做真正的同行对比。代价是耗时约为 N×4。")
+        _max_peers = st.number_input("每个目标补充几家同行", 1, 10, 3, 1, key="rp_max_peers",
+                                     help="默认 3 家（同行前三名）")
     if st.button("开始汇总", type="primary", use_container_width=True):
-        tks = []
-        for line in (manual or "").replace("，", ",").splitlines():
-            s = line.strip()
-            if s:
-                tks.append({"code": s if s.isdigit() else "", "name": s})
+        tks = _parse_targets(manual)
         start_job(["report"], {"report": {"targets": tks or None, "start_year": int(sy),
-                                          "end_year": int(ey), "include_peers": inc_peers}})
+                                          "end_year": int(ey), "include_peers": inc_peers,
+                                          "auto_add_sector": auto_peers,
+                                          "max_peers": int(_max_peers)}})
     snap = render_job_progress()
     if snap and snap.get("result"):
         res = (snap["result"].get("results") or {}).get("report") or {}
